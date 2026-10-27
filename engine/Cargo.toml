@@ -1,0 +1,8 @@
+[package]
+name = "patina-engine"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# cdylib: the .dll/.so/.dylib Java loads; rlib: lets `cargo test` link the crate.
+crate-type = ["cdylib", "rlib"]

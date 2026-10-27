@@ -1,0 +1,6 @@
+engine/target/
+service/build/
+service/.gradle/
+.idea/
+*.iml
+PLAN.md
