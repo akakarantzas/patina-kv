@@ -1,0 +1,85 @@
+//! Kill-the-process test (PLAN.md phase 1a): no acknowledged write is lost when the process dies.
+// A process kill doesn't test power loss; the torn-write test in wal.rs and fsync-before-ack cover that.
+
+use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use patina_engine::Engine;
+
+/// Caps the child, so one orphaned by a dead parent can't fill the disk.
+const WRITES: u32 = 100_000;
+
+fn key(i: u32) -> [u8; 4] {
+    i.to_be_bytes()
+}
+
+fn value(i: u32) -> Vec<u8> {
+    format!("value-{i}").into_bytes()
+}
+
+/// The writer process the test below spawns and kills; a no-op unless PATINA_CRASH_DIR is set.
+#[test]
+#[ignore]
+fn child_writer() {
+    let Some(dir) = std::env::var_os("PATINA_CRASH_DIR") else { return };
+    let engine = Engine::open(Path::new(&dir)).unwrap();
+    for i in 0..WRITES {
+        engine.put(&key(i), &value(i)).unwrap();
+        println!("ack {i}");
+        std::io::stdout().flush().unwrap();
+    }
+}
+
+#[test]
+fn no_acked_write_lost_on_kill() {
+    for iteration in 0..100 {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_writer", "--ignored", "--nocapture"])
+            .env("PATINA_CRASH_DIR", tmp.path())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // Drain stdout on its own thread: a full pipe would block the child and the test would measure nothing.
+        let stdout = child.stdout.take().unwrap();
+        let (tx, acks) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(i) = line.strip_prefix("ack ") {
+                    let _ = tx.send(i.parse::<u32>().unwrap());
+                }
+            }
+        });
+
+        // Time the kill from the first ack, not from spawn, so slow startup can't kill the child before it writes.
+        let Ok(first) = acks.recv_timeout(Duration::from_secs(10)) else {
+            child.kill().unwrap();
+            panic!("iteration {iteration}: no ack within 10 s, dir {}", tmp.keep().display());
+        };
+        let delay = 20 + SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() % 181;
+        std::thread::sleep(Duration::from_millis(delay.into()));
+        assert!(child.try_wait().unwrap().is_none(), "iteration {iteration}: child exited before the kill");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        reader.join().unwrap();
+        let last_ack = acks.try_iter().last().unwrap_or(first);
+
+        // The child writes only keys 0..WRITES, so probing that range finds any key it could have left behind.
+        let engine = Engine::open(tmp.path()).unwrap();
+        let bad = (0..WRITES).find(|&i| match engine.get(&key(i)) {
+            Some(v) => i > last_ack + 1 || v != value(i), // last_ack + 1 is the in-flight write: optional, but intact
+            None => i <= last_ack,
+        });
+        if let Some(i) = bad {
+            let got = engine.get(&key(i)).map(|v| String::from_utf8_lossy(&v).into_owned());
+            panic!(
+                "iteration {iteration}: first bad key is {i} (got {got:?}, last ack {last_ack}), dir {}",
+                tmp.keep().display()
+            );
+        }
+    }
+}
