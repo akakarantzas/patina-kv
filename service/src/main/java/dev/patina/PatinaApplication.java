@@ -14,12 +14,16 @@ public class PatinaApplication {
         SpringApplication.run(PatinaApplication.class, args);
     }
 
-    /** Defaults to the cargo release build next to this project; override with --patina.library=... */
+    /**
+     * Defaults to the cargo release build next to this project and ./data in the working dir;
+     * override with --patina.library=... and --patina.data-dir=...
+     */
     @Bean(destroyMethod = "close")
-    PatinaEngine patinaEngine(@Value("${patina.library:}") String library) {
+    PatinaEngine patinaEngine(@Value("${patina.library:}") String library,
+                              @Value("${patina.data-dir:data}") String dataDir) {
         Path path = library.isBlank()
                 ? Path.of("../engine/target/release", System.mapLibraryName("patina_engine"))
                 : Path.of(library);
-        return new PatinaEngine(path.toAbsolutePath());
+        return new PatinaEngine(path.toAbsolutePath(), Path.of(dataDir).toAbsolutePath());
     }
 }

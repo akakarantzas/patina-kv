@@ -3,3 +3,4 @@ service/build/
 service/.gradle/
 .idea/
 *.iml
+service/data/

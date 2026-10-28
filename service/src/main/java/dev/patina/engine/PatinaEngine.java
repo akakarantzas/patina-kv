@@ -4,6 +4,7 @@ import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
+import static java.nio.charset.StandardCharsets.UTF_8;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
@@ -35,20 +36,22 @@ public final class PatinaEngine implements AutoCloseable {
     private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private boolean closed;
 
-    public PatinaEngine(Path library) {
+    public PatinaEngine(Path library, Path dataDir) {
         SymbolLookup lib = SymbolLookup.libraryLookup(library, libraryArena);
-        MethodHandle open = bind(lib, "patina_open", FunctionDescriptor.of(ADDRESS));
+        MethodHandle open = bind(lib, "patina_open", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG));
         close = bind(lib, "patina_close", FunctionDescriptor.ofVoid(ADDRESS));
         put = bind(lib, "patina_put", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG));
         get = bind(lib, "patina_get", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS));
         free = bind(lib, "patina_free", FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG));
-        try {
-            handle = (MemorySegment) open.invokeExact();
+        byte[] path = dataDir.toString().getBytes(UTF_8);
+        try (Arena call = Arena.ofConfined()) {
+            handle = (MemorySegment) open.invokeExact(call.allocateFrom(JAVA_BYTE, path), (long) path.length);
         } catch (Throwable t) {
             throw rethrow(t);
         }
         if (handle.equals(MemorySegment.NULL)) {
-            throw new IllegalStateException("patina_open failed");
+            libraryArena.close();
+            throw new IllegalStateException("patina_open failed for data dir " + dataDir + " (reason on stderr)");
         }
     }
 
