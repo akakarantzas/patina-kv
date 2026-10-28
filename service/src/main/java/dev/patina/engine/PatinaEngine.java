@@ -13,6 +13,7 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Java side of the Rust engine's C ABI (engine/src/lib.rs), called through the Foreign Function & Memory API.
@@ -30,6 +31,8 @@ public final class PatinaEngine implements AutoCloseable {
     private final MethodHandle get;
     private final MethodHandle free;
     private final MemorySegment handle;
+    // Calls hold the read lock for the whole native call; close takes the write lock, so the handle is never freed mid-call.
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
     private boolean closed;
 
     public PatinaEngine(Path library) {
@@ -50,18 +53,24 @@ public final class PatinaEngine implements AutoCloseable {
     }
 
     public void put(byte[] key, byte[] value) {
+        lock.readLock().lock();
         try (Arena call = Arena.ofConfined()) {
+            checkOpen();
             int rc = (int) put.invokeExact(handle,
                     call.allocateFrom(JAVA_BYTE, key), (long) key.length,
                     call.allocateFrom(JAVA_BYTE, value), (long) value.length);
             check(rc, "put");
         } catch (Throwable t) {
             throw rethrow(t);
+        } finally {
+            lock.readLock().unlock();
         }
     }
 
     public Optional<byte[]> get(byte[] key) {
+        lock.readLock().lock();
         try (Arena call = Arena.ofConfined()) {
+            checkOpen();
             MemorySegment out = call.allocate(ADDRESS);
             MemorySegment outLen = call.allocate(JAVA_LONG);
             int rc = (int) get.invokeExact(handle, call.allocateFrom(JAVA_BYTE, key), (long) key.length, out, outLen);
@@ -78,21 +87,34 @@ public final class PatinaEngine implements AutoCloseable {
             }
         } catch (Throwable t) {
             throw rethrow(t);
+        } finally {
+            lock.readLock().unlock();
         }
     }
 
     @Override
-    public synchronized void close() {
-        if (closed) {
-            return;
-        }
-        closed = true;
+    public void close() {
+        lock.writeLock().lock();
         try {
-            close.invokeExact(handle);
+            if (closed) {
+                return;
+            }
+            closed = true;
+            try {
+                close.invokeExact(handle);
+            } finally {
+                libraryArena.close();
+            }
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
-            libraryArena.close();
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void checkOpen() {
+        if (closed) {
+            throw new IllegalStateException("engine is closed");
         }
     }
 
