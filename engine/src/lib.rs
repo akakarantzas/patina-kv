@@ -1,3 +1,5 @@
+pub mod wal;
+
 use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;

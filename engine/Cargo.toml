@@ -6,3 +6,9 @@ edition = "2024"
 [lib]
 # cdylib: the .dll/.so/.dylib Java loads; rlib: lets `cargo test` link the crate.
 crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = "3"
