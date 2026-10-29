@@ -22,7 +22,9 @@ curl "localhost:8080/items?limit=50"
 curl -X DELETE localhost:8080/items/user1
 ```
 
-`GET /items` lists keys in byte order, up to `limit` per page (1–1000, default 50): `{"items":[{"key":"user1","value":"YWxpY2U="}],"next":null}`, with values in base64. When `next` isn't `null`, pass it back as `?after=` (URL-encoded) for the next page.
+On Windows PowerShell, type `curl.exe` instead of `curl` (there `curl` means `Invoke-WebRequest`), or run these in Git Bash.
+
+Keys are a single path segment, so no `/`; values can be up to 1 MiB, and bigger PUTs get 413. `GET /items` lists keys in byte order, up to `limit` per page (1–1000, default 50): `{"items":[{"key":"user1","value":"YWxpY2U="}],"next":null}`, with values in base64. When `next` isn't `null`, pass it back as `?after=` (URL-encoded) for the next page.
 
 Data lives in `service/data/` (override with `./gradlew bootRun --args='--patina.data-dir=...'`); delete it for a clean start.
 
