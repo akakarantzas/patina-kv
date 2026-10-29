@@ -32,6 +32,8 @@ def cargoBuild = tasks.register('cargoBuild', Exec) {
 tasks.withType(Test).configureEach {
     useJUnitPlatform()
     dependsOn cargoBuild
+    // The tests load this library, so a Rust-only change must not leave them UP-TO-DATE.
+    inputs.file("../engine/target/release/${System.mapLibraryName('patina_engine')}")
     jvmArgs '--enable-native-access=ALL-UNNAMED'
 }
 
