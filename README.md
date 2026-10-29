@@ -7,7 +7,7 @@ HTTP ──► service/ (Java 25, Spring Boot) ──FFM──► engine/ (Rust 
 
 ## Run
 
-Needs Rust 1.85+ (`cargo`) and JDK 25. Gradle comes from the wrapper (`gradlew`). On Windows, Rust's default toolchain also needs the Visual Studio C++ Build Tools (the free "Build Tools" download, not the full IDE).
+Needs Rust 1.85+ (`cargo`) and JDK 25. Gradle comes from the wrapper (`gradlew`). On Windows, Rust's default toolchain also needs the Visual Studio C++ Build Tools (the free "Build Tools" download, not the full IDE), and the commands below run in Git Bash.
 
 ```bash
 cd service
@@ -21,8 +21,6 @@ curl localhost:8080/items/user1
 curl "localhost:8080/items?limit=50"
 curl -X DELETE localhost:8080/items/user1
 ```
-
-On Windows PowerShell, type `curl.exe` instead of `curl` (there `curl` means `Invoke-WebRequest`), or run these in Git Bash.
 
 Keys are a single path segment, so no `/`; values can be up to 1 MiB, and bigger PUTs get 413. `GET /items` lists keys in byte order, up to `limit` per page (1–1000, default 50): `{"items":[{"key":"user1","value":"YWxpY2U="}],"next":null}`, with values in base64. When `next` isn't `null`, pass it back as `?after=` (URL-encoded) for the next page.
 
