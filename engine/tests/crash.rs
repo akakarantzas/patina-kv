@@ -70,18 +70,23 @@ fn no_acked_write_lost_on_kill() {
             }
         });
 
-        // Time the kill from the first ack, not from spawn, so slow startup can't kill the child before it writes.
-        let Ok(first) = acks.recv_timeout(Duration::from_secs(10)) else {
-            child.kill().unwrap();
-            panic!("iteration {iteration}: no ack within 10 s, dir {}", tmp.keep().display());
+        // Kill after a random number of acks, not a random time: compaction starts after a fixed number of writes
+        // (about 20), and on a slow disk (the Windows CI runner) a 20-200 ms window never got that far.
+        let target = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() % 61;
+        let seen = loop {
+            let Ok(ack) = acks.recv_timeout(Duration::from_secs(10)) else {
+                child.kill().unwrap();
+                panic!("iteration {iteration}: no ack within 10 s, dir {}", tmp.keep().display());
+            };
+            if ack >= target {
+                break ack;
+            }
         };
-        let delay = 20 + SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() % 181;
-        std::thread::sleep(Duration::from_millis(delay.into()));
         assert!(child.try_wait().unwrap().is_none(), "iteration {iteration}: child exited before the kill");
         child.kill().unwrap();
         child.wait().unwrap();
         reader.join().unwrap();
-        let last_ack = acks.try_iter().last().unwrap_or(first);
+        let last_ack = acks.try_iter().last().unwrap_or(seen);
 
         // Only a compaction writes a nonzero compacted_through.
         let compacted = std::fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().path()).any(|path| {
