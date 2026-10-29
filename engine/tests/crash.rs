@@ -50,6 +50,7 @@ fn child_writer() {
 #[test]
 fn no_acked_write_lost_on_kill() {
     let mut iterations_compacted = 0;
+    let mut iterations_mid_flush = 0;
     for iteration in 0..100 {
         let tmp = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -70,9 +71,10 @@ fn no_acked_write_lost_on_kill() {
             }
         });
 
-        // Kill after a random number of acks, not a random time: compaction starts after a fixed number of writes
+        // Wait for a random number of acks, not a random time: compaction starts after a fixed number of writes
         // (about 20), and on a slow disk (the Windows CI runner) a 20-200 ms window never got that far.
-        let target = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() % 61;
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos();
+        let target = nanos % 61;
         let seen = loop {
             let Ok(ack) = acks.recv_timeout(Duration::from_secs(10)) else {
                 child.kill().unwrap();
@@ -82,6 +84,8 @@ fn no_acked_write_lost_on_kill() {
                 break ack;
             }
         };
+        // Then a random delay, or the kill always lands at the start of the next write, before any flush begins.
+        std::thread::sleep(Duration::from_millis((nanos / 61 % 51).into()));
         assert!(child.try_wait().unwrap().is_none(), "iteration {iteration}: child exited before the kill");
         child.kill().unwrap();
         child.wait().unwrap();
@@ -93,6 +97,9 @@ fn no_acked_write_lost_on_kill() {
             path.extension().is_some_and(|x| x == "sst") && SsTable::open(&path).unwrap().compacted_through() > 0
         });
         iterations_compacted += usize::from(compacted);
+        // A flush or compaction writes <seq>.sst.tmp and renames it, so a leftover .tmp means the kill landed mid-way.
+        let mid_flush = std::fs::read_dir(tmp.path()).unwrap().any(|e| e.unwrap().path().extension().is_some_and(|x| x == "tmp"));
+        iterations_mid_flush += usize::from(mid_flush);
 
         // The child writes only keys 0..WRITES, so probing that range finds any key it could have left behind.
         let engine = Engine::open(tmp.path(), tiny()).unwrap();
@@ -118,4 +125,6 @@ fn no_acked_write_lost_on_kill() {
     }
     // Otherwise the kills never met a flush or a compaction and the test proved nothing about them.
     assert!(iterations_compacted > 0, "no iteration compacted its SSTables");
+    // Measured locally: 17-20 of 100 with the delay, 0-1 without it, so 5 catches losing it without flaking.
+    assert!(iterations_mid_flush >= 5, "only {iterations_mid_flush} kills landed mid-flush or mid-compaction");
 }
