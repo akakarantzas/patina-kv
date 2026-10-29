@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PutMapping;
@@ -33,6 +34,12 @@ class ItemController {
             return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE).build();
         }
         engine.put(key.getBytes(UTF_8), value);
+        return ResponseEntity.noContent().build();
+    }
+
+    @DeleteMapping("/{key}")
+    ResponseEntity<Void> delete(@PathVariable String key) {
+        engine.delete(key.getBytes(UTF_8));
         return ResponseEntity.noContent().build();
     }
 

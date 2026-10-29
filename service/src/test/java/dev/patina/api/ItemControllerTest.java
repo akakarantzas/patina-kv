@@ -1,8 +1,10 @@
 package dev.patina.api;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -28,6 +30,13 @@ class ItemControllerTest {
                 .andExpect(status().isNoContent());
 
         verify(engine).put(any(), any());
+    }
+
+    @Test
+    void deleteReturnsNoContent() throws Exception {
+        mvc.perform(delete("/items/k")).andExpect(status().isNoContent());
+
+        verify(engine).delete("k".getBytes(UTF_8));
     }
 
     @Test

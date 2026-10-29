@@ -20,6 +20,11 @@ fn value(i: u32) -> Vec<u8> {
     format!("value-{i}").into_bytes()
 }
 
+/// Every 5th key is put and then deleted before its ack.
+fn is_deleted(i: u32) -> bool {
+    i % 5 == 0
+}
+
 /// The writer process the test below spawns and kills; a no-op unless PATINA_CRASH_DIR is set.
 #[test]
 #[ignore]
@@ -28,6 +33,9 @@ fn child_writer() {
     let engine = Engine::open(Path::new(&dir)).unwrap();
     for i in 0..WRITES {
         engine.put(&key(i), &value(i)).unwrap();
+        if is_deleted(i) {
+            engine.delete(&key(i)).unwrap();
+        }
         println!("ack {i}");
         std::io::stdout().flush().unwrap();
     }
@@ -70,9 +78,17 @@ fn no_acked_write_lost_on_kill() {
 
         // The child writes only keys 0..WRITES, so probing that range finds any key it could have left behind.
         let engine = Engine::open(tmp.path()).unwrap();
-        let bad = (0..WRITES).find(|&i| match engine.get(&key(i)) {
-            Some(v) => i > last_ack + 1 || v != value(i), // last_ack + 1 is the in-flight write: optional, but intact
-            None => i <= last_ack,
+        let bad = (0..WRITES).find(|&i| {
+            let got = engine.get(&key(i));
+            if i > last_ack + 1 {
+                got.is_some()
+            } else if i == last_ack + 1 {
+                got.is_some_and(|v| v != value(i)) // in flight: absent, put or deleted, but never garbled
+            } else if is_deleted(i) {
+                got.is_some()
+            } else {
+                got != Some(value(i))
+            }
         });
         if let Some(i) = bad {
             let got = engine.get(&key(i)).map(|v| String::from_utf8_lossy(&v).into_owned());

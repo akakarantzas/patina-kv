@@ -1,5 +1,6 @@
 //! Write-ahead log. Each record, little-endian: [payload_len u32][crc32 u32 of payload][payload],
-//! where payload = [op u8][key_len u32][key][value_len u32][value].
+//! where payload = [op u8][key_len u32][key][value_len u32][value] for a Put (op 0),
+//! and [op u8][key_len u32][key] for a Delete (op 1).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -9,10 +10,12 @@ use std::path::Path;
 pub const MAX_RECORD: usize = 4 * 1024 * 1024;
 const HEADER: usize = 8;
 const OP_PUT: u8 = 0;
+const OP_DELETE: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Record {
     Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
 }
 
 pub struct Wal {
@@ -56,8 +59,11 @@ impl Wal {
         if self.failed {
             return Err(io::Error::other("an earlier WAL append failed; reopen the log to recover"));
         }
-        let Record::Put { key, value } = record;
-        let len = 1 + 4 + key.len() + 4 + value.len();
+        let (op, key, value) = match record {
+            Record::Put { key, value } => (OP_PUT, key, Some(value)),
+            Record::Delete { key } => (OP_DELETE, key, None),
+        };
+        let len = 1 + 4 + key.len() + value.map_or(0, |v| 4 + v.len());
         if len > MAX_RECORD {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -66,8 +72,8 @@ impl Wal {
         }
         let mut buf = Vec::with_capacity(HEADER + len);
         buf.extend_from_slice(&[0; HEADER]); // filled in once the payload's crc is known
-        buf.push(OP_PUT);
-        for field in [key, value] {
+        buf.push(op);
+        for field in std::iter::once(key).chain(value) {
             buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
             buf.extend_from_slice(field);
         }
@@ -95,9 +101,15 @@ fn parse(buf: &[u8]) -> Option<(Record, usize)> {
     }
     let (&op, rest) = payload.split_first()?;
     let (key, rest) = take_bytes(rest)?;
-    let (value, rest) = take_bytes(rest)?;
-    (op == OP_PUT && rest.is_empty())
-        .then(|| (Record::Put { key: key.to_vec(), value: value.to_vec() }, HEADER + len))
+    let (record, rest) = match op {
+        OP_PUT => {
+            let (value, rest) = take_bytes(rest)?;
+            (Record::Put { key: key.to_vec(), value: value.to_vec() }, rest)
+        }
+        OP_DELETE => (Record::Delete { key: key.to_vec() }, rest),
+        _ => return None,
+    };
+    rest.is_empty().then_some((record, HEADER + len))
 }
 
 fn take_u32(buf: &[u8]) -> Option<(u32, &[u8])> {
@@ -149,7 +161,8 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
-        let records = vec![put(b"", b""), put(b"k", b""), put(b"", b"v"), put(b"big", &vec![7; 1 << 20]), put(b"k", b"v2")];
+        let records = vec![put(b"", b""), put(b"k", b""), put(b"", b"v"), put(b"big", &vec![7; 1 << 20]), put(b"k", b"v2"),
+            Record::Delete { key: b"k".to_vec() }, Record::Delete { key: vec![] }];
         write_log(&path, &records);
         assert_eq!(Wal::open(&path).unwrap().1, records);
     }
@@ -158,7 +171,9 @@ mod tests {
     fn torn_tail_at_every_length() {
         let dir = tempfile::tempdir().unwrap();
         let (full, cut_path) = (dir.path().join("full.log"), dir.path().join("cut.log"));
-        let records: Vec<Record> = (0..8u8).map(|i| put(&[i; 3], &vec![i; 10 * i as usize])).collect();
+        let records: Vec<Record> = (0..8u8)
+            .map(|i| if i % 3 == 2 { Record::Delete { key: vec![i; 3] } } else { put(&[i; 3], &vec![i; 10 * i as usize]) })
+            .collect();
         let ends = write_log(&full, &records);
         let bytes = fs::read(&full).unwrap();
         let extra = put(b"new", b"x");
@@ -206,8 +221,23 @@ mod tests {
 
     #[test]
     fn unknown_op_is_corrupt() {
-        let op_1 = frame(&[1, 0, 0, 0, 0, 0, 0, 0, 0]); // empty key and value
-        assert_eq!(open_with_tail(&op_1), [put(b"a", b"1")]);
+        let op_2 = frame(&[2, 0, 0, 0, 0]); // empty key
+        assert_eq!(open_with_tail(&op_2), [put(b"a", b"1")]);
+    }
+
+    #[test]
+    fn put_record_in_the_original_byte_layout_still_opens() {
+        // Built by hand, not by append(), so a change to the Put layout can't slip through unnoticed.
+        let old_put = frame(&[0, 1, 0, 0, 0, b'k', 1, 0, 0, 0, b'v']);
+        assert_eq!(open_with_tail(&old_put), [put(b"a", b"1"), put(b"k", b"v")]);
+    }
+
+    #[test]
+    fn delete_with_trailing_value_is_corrupt() {
+        let delete_with_value = frame(&[1, 0, 0, 0, 0, 0, 0, 0, 0]); // empty key, then a value field
+        assert_eq!(open_with_tail(&delete_with_value), [put(b"a", b"1")]);
+        let good_delete = frame(&[1, 1, 0, 0, 0, b'k']);
+        assert_eq!(open_with_tail(&good_delete), [put(b"a", b"1"), Record::Delete { key: b"k".to_vec() }]);
     }
 
     #[test]

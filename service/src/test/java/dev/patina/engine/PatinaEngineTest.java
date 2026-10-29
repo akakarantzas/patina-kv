@@ -40,6 +40,20 @@ class PatinaEngineTest {
     }
 
     @Test
+    void deleteCrossesIntoRustAndSurvivesReopen() {
+        byte[] k = "user#1".getBytes(UTF_8);
+        try (PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir)) {
+            engine.put(k, "alice".getBytes(UTF_8));
+            engine.delete(k);
+            assertThat(engine.get(k)).isEmpty();
+            engine.delete("missing".getBytes(UTF_8)); // not an error
+        }
+        try (PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir)) {
+            assertThat(engine.get(k)).isEmpty();
+        }
+    }
+
+    @Test
     void dataDirThatIsAFileFailsToOpen() throws IOException {
         Path file = Files.createFile(dataDir.resolve("not-a-dir"));
 
@@ -56,6 +70,8 @@ class PatinaEngineTest {
         assertThatIllegalStateException().isThrownBy(() -> engine.put(new byte[] {1}, new byte[] {2}))
                 .withMessage("engine is closed");
         assertThatIllegalStateException().isThrownBy(() -> engine.get(new byte[] {1}))
+                .withMessage("engine is closed");
+        assertThatIllegalStateException().isThrownBy(() -> engine.delete(new byte[] {1}))
                 .withMessage("engine is closed");
     }
 

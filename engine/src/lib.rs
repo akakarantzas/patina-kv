@@ -13,10 +13,24 @@ pub struct Engine {
     state: RwLock<State>,
 }
 
+/// A deleted key stays in the memtable as a Tombstone so older SSTables can't show through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Value(Vec<u8>),
+    Tombstone,
+}
+
 // The WAL shares the memtable's lock, so WAL order always matches memtable order.
 struct State {
-    memtable: BTreeMap<Vec<u8>, Vec<u8>>,
+    memtable: BTreeMap<Vec<u8>, Value>,
     wal: Wal,
+}
+
+fn apply(memtable: &mut BTreeMap<Vec<u8>, Value>, record: Record) {
+    match record {
+        Record::Put { key, value } => memtable.insert(key, Value::Value(value)),
+        Record::Delete { key } => memtable.insert(key, Value::Tombstone),
+    };
 }
 
 impl Engine {
@@ -32,24 +46,34 @@ impl Engine {
         }
         let (wal, records) = Wal::open(&dir.join("wal.log"))?;
         let mut memtable = BTreeMap::new();
-        for Record::Put { key, value } in records {
-            memtable.insert(key, value);
+        for record in records {
+            apply(&mut memtable, record);
         }
         Ok(Engine { state: RwLock::new(State { memtable, wal }) })
     }
 
     /// Returns Ok only once the write is on disk; on error the memtable is unchanged.
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
+        self.write(Record::Put { key: key.to_vec(), value: value.to_vec() })
+    }
+
+    /// Same durability as `put`. Deleting a missing key succeeds and still records a tombstone.
+    pub fn delete(&self, key: &[u8]) -> io::Result<()> {
+        self.write(Record::Delete { key: key.to_vec() })
+    }
+
+    fn write(&self, record: Record) -> io::Result<()> {
         let mut state = self.state.write().unwrap();
-        let record = Record::Put { key: key.to_vec(), value: value.to_vec() };
         state.wal.append(&record)?;
-        let Record::Put { key, value } = record;
-        state.memtable.insert(key, value);
+        apply(&mut state.memtable, record);
         Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        self.state.read().unwrap().memtable.get(key).cloned()
+        match self.state.read().unwrap().memtable.get(key) {
+            Some(Value::Value(v)) => Some(v.clone()),
+            Some(Value::Tombstone) | None => None,
+        }
     }
 }
 
@@ -116,6 +140,24 @@ pub unsafe extern "C" fn patina_put(
     .unwrap_or(ERR)
 }
 
+/// OK also when the key does not exist.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn patina_delete(engine: *const Engine, key: *const u8, key_len: usize) -> i32 {
+    if engine.is_null() {
+        return ERR;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        match (*engine).delete(bytes(key, key_len)) {
+            Ok(()) => OK,
+            Err(e) => {
+                eprintln!("patina_delete: {e}");
+                ERR
+            }
+        }
+    }))
+    .unwrap_or(ERR)
+}
+
 /// On OK, `*out`/`*out_len` hold a Rust-owned buffer the caller must release with `patina_free`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_get(
@@ -173,6 +215,11 @@ mod tests {
 
             let missing = b"nope";
             assert_eq!(patina_get(e, missing.as_ptr(), missing.len(), &mut out, &mut out_len), NOT_FOUND);
+
+            assert_eq!(patina_delete(e, k.as_ptr(), k.len()), OK);
+            assert_eq!(patina_get(e, k.as_ptr(), k.len(), &mut out, &mut out_len), NOT_FOUND);
+            assert_eq!(patina_delete(e, missing.as_ptr(), missing.len()), OK);
+            assert_eq!(patina_delete(ptr::null(), k.as_ptr(), k.len()), ERR);
             patina_close(e);
         }
     }
@@ -195,6 +242,48 @@ mod tests {
         let e = Engine::open(&dir).unwrap();
         assert_eq!(e.get(b"k"), Some(b"v2".to_vec()));
         assert_eq!(e.get(b"other"), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn delete_hides_key_and_keeps_a_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path()).unwrap();
+        e.put(b"k", b"v").unwrap();
+        e.delete(b"k").unwrap();
+        assert_eq!(e.get(b"k"), None);
+        assert_eq!(e.state.read().unwrap().memtable.get(&b"k"[..]), Some(&Value::Tombstone));
+
+        e.delete(b"never-existed").unwrap();
+        assert_eq!(e.get(b"never-existed"), None);
+    }
+
+    #[test]
+    fn delete_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path()).unwrap();
+        e.put(b"k", b"v").unwrap();
+        e.put(b"other", b"x").unwrap();
+        e.delete(b"k").unwrap();
+        e.delete(b"never-existed").unwrap();
+        drop(e);
+
+        let e = Engine::open(dir.path()).unwrap();
+        assert_eq!(e.get(b"k"), None);
+        assert_eq!(e.get(b"other"), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn put_after_delete_brings_key_back_and_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path()).unwrap();
+        e.put(b"k", b"old").unwrap();
+        e.delete(b"k").unwrap();
+        e.put(b"k", b"new").unwrap();
+        assert_eq!(e.get(b"k"), Some(b"new".to_vec()));
+        drop(e);
+
+        let e = Engine::open(dir.path()).unwrap();
+        assert_eq!(e.get(b"k"), Some(b"new".to_vec()));
     }
 
     #[test]

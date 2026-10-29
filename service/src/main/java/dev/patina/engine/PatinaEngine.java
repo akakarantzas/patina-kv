@@ -30,6 +30,7 @@ public final class PatinaEngine implements AutoCloseable {
     private final MethodHandle close;
     private final MethodHandle put;
     private final MethodHandle get;
+    private final MethodHandle delete;
     private final MethodHandle free;
     private final MemorySegment handle;
     // Calls hold the read lock for the whole native call; close takes the write lock, so the handle is never freed mid-call.
@@ -42,6 +43,7 @@ public final class PatinaEngine implements AutoCloseable {
         close = bind(lib, "patina_close", FunctionDescriptor.ofVoid(ADDRESS));
         put = bind(lib, "patina_put", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG));
         get = bind(lib, "patina_get", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS));
+        delete = bind(lib, "patina_delete", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG));
         free = bind(lib, "patina_free", FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG));
         byte[] path = dataDir.toString().getBytes(UTF_8);
         try (Arena call = Arena.ofConfined()) {
@@ -63,6 +65,20 @@ public final class PatinaEngine implements AutoCloseable {
                     call.allocateFrom(JAVA_BYTE, key), (long) key.length,
                     call.allocateFrom(JAVA_BYTE, value), (long) value.length);
             check(rc, "put");
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /** Succeeds whether or not the key exists. */
+    public void delete(byte[] key) {
+        lock.readLock().lock();
+        try (Arena call = Arena.ofConfined()) {
+            checkOpen();
+            int rc = (int) delete.invokeExact(handle, call.allocateFrom(JAVA_BYTE, key), (long) key.length);
+            check(rc, "delete");
         } catch (Throwable t) {
             throw rethrow(t);
         } finally {
