@@ -7,7 +7,7 @@ HTTP ──► service/ (Java 25, Spring Boot) ──FFM──► engine/ (Rust 
 
 ## Run
 
-Needs Rust (`cargo`) and JDK 25. Gradle comes from the wrapper (`gradlew`). On Windows without Visual Studio, use Rust's GNU toolchain: `rustup default stable-x86_64-pc-windows-gnu`.
+Needs Rust 1.85+ (`cargo`) and JDK 25. Gradle comes from the wrapper (`gradlew`). On Windows, Rust's default toolchain also needs the Visual Studio C++ Build Tools (the free "Build Tools" download, not the full IDE).
 
 ```bash
 cd service
@@ -19,6 +19,8 @@ cd service
 curl -X PUT localhost:8080/items/user1 -H "Content-Type: text/plain" -d alice
 curl localhost:8080/items/user1
 ```
+
+Data lives in `service/data/` (override with `--patina.data-dir=...`); delete it for a clean start.
 
 Rust tests alone: `cd engine && cargo test`.
 
