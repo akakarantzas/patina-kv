@@ -1,0 +1,2 @@
+# gradlew is a shell script: keep LF so it runs in Git Bash and on Linux even with core.autocrlf=true
+service/gradlew text eol=lf
