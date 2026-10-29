@@ -12,7 +12,11 @@ import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
@@ -31,6 +35,7 @@ public final class PatinaEngine implements AutoCloseable {
     private final MethodHandle put;
     private final MethodHandle get;
     private final MethodHandle delete;
+    private final MethodHandle scan;
     private final MethodHandle free;
     private final MemorySegment handle;
     // Calls hold the read lock for the whole native call; close takes the write lock, so the handle is never freed mid-call.
@@ -44,6 +49,7 @@ public final class PatinaEngine implements AutoCloseable {
         put = bind(lib, "patina_put", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG));
         get = bind(lib, "patina_get", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS));
         delete = bind(lib, "patina_delete", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG));
+        scan = bind(lib, "patina_scan", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS));
         free = bind(lib, "patina_free", FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG));
         byte[] path = dataDir.toString().getBytes(UTF_8);
         try (Arena call = Arena.ofConfined()) {
@@ -109,6 +115,48 @@ public final class PatinaEngine implements AutoCloseable {
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    public record Entry(byte[] key, byte[] value) {}
+
+    public record ScanPage(List<Entry> items, boolean more) {}
+
+    /** Live keys >= start in byte order, at most limit (Rust clamps it to 1..1000); more is true if another key follows. */
+    public ScanPage scan(byte[] start, int limit) {
+        lock.readLock().lock();
+        try (Arena call = Arena.ofConfined()) {
+            checkOpen();
+            MemorySegment out = call.allocate(ADDRESS);
+            MemorySegment outLen = call.allocate(JAVA_LONG);
+            int rc = (int) scan.invokeExact(handle, call.allocateFrom(JAVA_BYTE, start), (long) start.length, limit, out, outLen);
+            check(rc, "scan");
+            long len = outLen.get(JAVA_LONG, 0);
+            MemorySegment buf = out.get(ADDRESS, 0);
+            try {
+                // [count u32][more u8] then count x [key_len u32][key][value_len u32][value], little-endian
+                ByteBuffer b = buf.reinterpret(len).asByteBuffer().order(ByteOrder.LITTLE_ENDIAN);
+                int count = b.getInt();
+                boolean more = b.get() != 0;
+                List<Entry> items = new ArrayList<>(count);
+                for (int i = 0; i < count; i++) {
+                    byte[] key = field(b);
+                    items.add(new Entry(key, field(b)));
+                }
+                return new ScanPage(items, more);
+            } finally {
+                free.invokeExact(buf, len); // Rust allocated it, so Rust frees it
+            }
+        } catch (Throwable t) {
+            throw rethrow(t);
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    private static byte[] field(ByteBuffer b) {
+        byte[] bytes = new byte[b.getInt()];
+        b.get(bytes);
+        return bytes;
     }
 
     @Override

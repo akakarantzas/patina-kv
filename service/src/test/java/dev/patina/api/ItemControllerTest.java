@@ -2,14 +2,18 @@ package dev.patina.api;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import dev.patina.engine.PatinaEngine;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.http.MediaType;
@@ -37,6 +41,14 @@ class ItemControllerTest {
         mvc.perform(delete("/items/k")).andExpect(status().isNoContent());
 
         verify(engine).delete("k".getBytes(UTF_8));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "1001"})
+    void scanLimitOutsideOneToThousandIsRejectedBeforeReachingRust(String limit) throws Exception {
+        mvc.perform(get("/items").param("limit", limit)).andExpect(status().isBadRequest());
+
+        verify(engine, never()).scan(any(), anyInt());
     }
 
     @Test

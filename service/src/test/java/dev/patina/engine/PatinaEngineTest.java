@@ -73,6 +73,8 @@ class PatinaEngineTest {
                 .withMessage("engine is closed");
         assertThatIllegalStateException().isThrownBy(() -> engine.delete(new byte[] {1}))
                 .withMessage("engine is closed");
+        assertThatIllegalStateException().isThrownBy(() -> engine.scan(new byte[0], 10))
+                .withMessage("engine is closed");
     }
 
     @Test
