@@ -37,6 +37,15 @@ class ItemControllerTest {
     }
 
     @Test
+    void formEncodedBodyIsStoredAsIs() throws Exception {
+        // curl -d sends this content type by default
+        mvc.perform(put("/items/k").contentType(MediaType.APPLICATION_FORM_URLENCODED).content("a=1&b"))
+                .andExpect(status().isNoContent());
+
+        verify(engine).put("k".getBytes(UTF_8), "a=1&b".getBytes(UTF_8));
+    }
+
+    @Test
     void deleteReturnsNoContent() throws Exception {
         mvc.perform(delete("/items/k")).andExpect(status().isNoContent());
 
