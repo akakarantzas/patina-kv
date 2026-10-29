@@ -1,5 +1,5 @@
 //! Kill-the-process test (PLAN.md phases 1 and 2): no acknowledged write is lost when the process dies,
-//! including mid-flush: the tiny memtable limit makes the child flush every few writes.
+//! including mid-flush and mid-compaction: the tiny limits make the child flush every few writes and compact every other flush.
 // A process kill doesn't test power loss; the torn-write test in wal.rs and fsync-before-ack cover that.
 
 use std::io::{BufRead, BufReader, Write};
@@ -8,13 +8,14 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use patina_engine::sstable::SsTable;
 use patina_engine::{Engine, Options};
 
 /// Caps the child, so one orphaned by a dead parent can't fill the disk.
 const WRITES: u32 = 100_000;
 
 fn tiny() -> Options {
-    Options { memtable_limit_bytes: 100 }
+    Options { memtable_limit_bytes: 100, max_sstables: 2 }
 }
 
 fn key(i: u32) -> [u8; 4] {
@@ -48,7 +49,7 @@ fn child_writer() {
 
 #[test]
 fn no_acked_write_lost_on_kill() {
-    let mut iterations_with_sstables = 0;
+    let mut iterations_compacted = 0;
     for iteration in 0..100 {
         let tmp = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -82,8 +83,11 @@ fn no_acked_write_lost_on_kill() {
         reader.join().unwrap();
         let last_ack = acks.try_iter().last().unwrap_or(first);
 
-        let flushed = std::fs::read_dir(tmp.path()).unwrap().any(|e| e.unwrap().path().extension().is_some_and(|x| x == "sst"));
-        iterations_with_sstables += usize::from(flushed);
+        // Only a compaction writes a nonzero compacted_through.
+        let compacted = std::fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().path()).any(|path| {
+            path.extension().is_some_and(|x| x == "sst") && SsTable::open(&path).unwrap().compacted_through() > 0
+        });
+        iterations_compacted += usize::from(compacted);
 
         // The child writes only keys 0..WRITES, so probing that range finds any key it could have left behind.
         let engine = Engine::open(tmp.path(), tiny()).unwrap();
@@ -107,6 +111,6 @@ fn no_acked_write_lost_on_kill() {
             );
         }
     }
-    // Otherwise the kills never met a flush and the test proved nothing about it.
-    assert!(iterations_with_sstables > 0, "no iteration flushed an SSTable");
+    // Otherwise the kills never met a flush or a compaction and the test proved nothing about them.
+    assert!(iterations_compacted > 0, "no iteration compacted its SSTables");
 }

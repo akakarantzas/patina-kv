@@ -22,11 +22,13 @@ pub struct Engine {
 pub struct Options {
     /// A write that takes the bytes written since the last flush past this flushes the memtable to an SSTable.
     pub memtable_limit_bytes: usize,
+    /// A flush that leaves more SSTables than this merges them all into one.
+    pub max_sstables: usize,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { memtable_limit_bytes: 4 * 1024 * 1024 }
+        Options { memtable_limit_bytes: 4 * 1024 * 1024, max_sstables: 4 }
     }
 }
 
@@ -43,8 +45,8 @@ struct State {
     /// Key and value bytes written since the last flush. Overwrites count again, so this also bounds the WAL size.
     memtable_bytes: usize,
     wal: Wal,
-    /// Newest seq first.
-    sstables: Vec<SsTable>,
+    /// (seq, table), newest seq first.
+    sstables: Vec<(u64, SsTable)>,
     next_seq: u64,
 }
 
@@ -63,9 +65,37 @@ fn sst_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{seq:06}.sst"))
 }
 
+/// Closes `tables`, then deletes their files: Windows can't fully delete a file that is still open.
+fn remove_tables(dir: &Path, tables: Vec<(u64, SsTable)>) -> io::Result<()> {
+    let seqs: Vec<u64> = tables.iter().map(|&(seq, _)| seq).collect();
+    drop(tables);
+    seqs.into_iter().try_for_each(|seq| fs::remove_file(sst_path(dir, seq)))
+}
+
+/// Streams the live entries of `tables` (newest first) in key order, reading one value at a time.
+/// Per key the newest table wins; a key whose newest entry is a tombstone is skipped.
+// shortcut: finds the smallest key by checking every table, O(tables) per key; use a BinaryHeap if max_sstables grows large.
+fn merge(tables: &[(u64, SsTable)]) -> impl Iterator<Item = io::Result<(&[u8], Value)>> {
+    let mut cursors: Vec<_> = tables.iter().map(|(_, table)| table.keys().peekable()).collect();
+    std::iter::from_fn(move || {
+        loop {
+            // min_by_key returns the first of equal keys, and the tables are newest first.
+            let (newest, key) =
+                cursors.iter_mut().enumerate().filter_map(|(i, keys)| Some((i, *keys.peek()?))).min_by_key(|&(_, key)| key)?;
+            for keys in &mut cursors {
+                keys.next_if_eq(&key);
+            }
+            match tables[newest].1.get(key).transpose()? {
+                Ok(Value::Tombstone) => {}
+                entry => return Some(entry.map(|value| (key, value))),
+            }
+        }
+    })
+}
+
 impl Engine {
-    /// Creates `dir` if needed, deletes leftover `*.tmp` files, opens its `<seq>.sst` files
-    /// and replays `<dir>/wal.log` into the memtable.
+    /// Creates `dir` if needed, deletes leftover `*.tmp` files, opens its `<seq>.sst` files, deletes the ones
+    /// a compaction already merged, and replays `<dir>/wal.log` into the memtable.
     /// shortcut: no lock file, so two processes opening the same dir corrupt each other's WAL; add one before running more than one instance.
     pub fn open(dir: &Path, options: Options) -> io::Result<Engine> {
         fs::create_dir_all(dir)?;
@@ -91,7 +121,13 @@ impl Engine {
             }
         }
         let next_seq = tables.keys().next_back().map_or(1, |seq| seq + 1);
-        let sstables = tables.values().rev().map(|path| SsTable::open(path)).collect::<io::Result<_>>()?;
+        let mut sstables =
+            tables.into_iter().rev().map(|(seq, path)| Ok((seq, SsTable::open(&path)?))).collect::<io::Result<Vec<_>>>()?;
+        // A crash between a compaction's rename and its deletes leaves inputs behind that may still hold values
+        // whose tombstones the merge dropped. Every seq up to the newest compacted_through was an input.
+        let through = sstables.iter().map(|(_, table)| table.compacted_through()).max().unwrap_or(0);
+        let merged = sstables.split_off(sstables.partition_point(|&(seq, _)| seq > through));
+        remove_tables(dir, merged)?;
 
         let (wal, records) = Wal::open(&dir.join("wal.log"))?;
         let mut memtable = BTreeMap::new();
@@ -118,9 +154,13 @@ impl Engine {
         state.wal.append(&record)?;
         state.memtable_bytes += apply(&mut state.memtable, record);
         if state.memtable_bytes > self.options.memtable_limit_bytes {
-            // The write is already durable in the WAL, so a failed flush must not fail it; the next write retries.
+            // The write is already durable in the WAL, so a failed flush or compaction must not fail it; the next flush retries.
             if let Err(e) = self.flush(&mut state) {
                 eprintln!("patina: flush to an SSTable failed, retrying on the next write: {e}");
+            } else if state.sstables.len() > self.options.max_sstables {
+                if let Err(e) = self.compact(&mut state) {
+                    eprintln!("patina: compaction failed: {e}");
+                }
             }
         }
         Ok(())
@@ -138,11 +178,35 @@ impl Engine {
         let table = SsTable::open(&path)?;
         // A crash before this reset leaves the data in both places: replay rebuilds exactly this table's entries, which shadow it harmlessly.
         state.wal.reset()?;
-        state.sstables.insert(0, table);
+        state.sstables.insert(0, (state.next_seq, table));
         state.next_seq += 1;
         state.memtable.clear();
         state.memtable_bytes = 0;
         Ok(())
+    }
+
+    /// Merges every SSTable into one at the next seq without tombstones, then deletes the inputs.
+    /// Dropping tombstones is safe: every table is an input, so no older value is left for them to hide.
+    // shortcut: rewrites every live entry (one seek + read per value) under the write lock, so reads and writes stall meanwhile; move it to a background thread if stalls matter.
+    fn compact(&self, state: &mut State) -> io::Result<()> {
+        let path = sst_path(&self.dir, state.next_seq);
+        let tmp = path.with_extension("sst.tmp");
+        let through = state.sstables[0].0;
+        let mut failed = None;
+        // A read error ends the merge early; checking `failed` keeps that short file from being renamed into place.
+        let entries = merge(&state.sstables).map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
+        sstable::write(&tmp, entries, through)?;
+        if let Some(e) = failed {
+            return Err(e);
+        }
+        fs::rename(&tmp, &path)?;
+        // Same Unix-only rule as wal.rs: the rename must be durable before the inputs are deleted.
+        #[cfg(unix)]
+        fs::File::open(&self.dir)?.sync_all()?;
+        let table = SsTable::open(&path)?;
+        let inputs = std::mem::replace(&mut state.sstables, vec![(state.next_seq, table)]);
+        state.next_seq += 1;
+        remove_tables(&self.dir, inputs)
     }
 
     /// Looks in the memtable, then the SSTables newest first. The first entry found wins, so a tombstone hides older values.
@@ -150,7 +214,7 @@ impl Engine {
         let state = self.state.read().unwrap();
         let found = match state.memtable.get(key) {
             Some(entry) => Some(entry.clone()),
-            None => state.sstables.iter().find_map(|table| table.get(key).transpose()).transpose()?,
+            None => state.sstables.iter().find_map(|(_, table)| table.get(key).transpose()).transpose()?,
         };
         Ok(match found {
             Some(Value::Value(v)) => Some(v),
@@ -412,7 +476,7 @@ mod tests {
     #[test]
     fn reads_span_many_sstables_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let tiny = || Options { memtable_limit_bytes: 64 };
+        let tiny = || Options { memtable_limit_bytes: 64, max_sstables: usize::MAX }; // never compacts, so reads must span tables
         let key = |i: u32| i.to_be_bytes();
         let e = Engine::open(dir.path(), tiny()).unwrap();
         for i in 0..100 {
@@ -476,7 +540,7 @@ mod tests {
     #[test]
     fn failed_flush_keeps_the_write_and_retries_on_the_next_one() {
         let dir = tempfile::tempdir().unwrap();
-        let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 10 }).unwrap();
+        let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 10, ..Options::default() }).unwrap();
         // A directory where the flush wants its temp file, so creating that file fails.
         let blocker = dir.path().join("000001.sst.tmp");
         fs::create_dir(&blocker).unwrap();
@@ -497,5 +561,91 @@ mod tests {
         check(&e);
         drop(e);
         check(&Engine::open(dir.path(), Options::default()).unwrap());
+    }
+
+    /// Flushes three tables, oldest first: {a: a1, b: b1, gone: x}, {a: a2, c: c2, gone: tombstone}, {b: b3}.
+    fn three_tables(dir: &Path) -> Engine {
+        let e = Engine::open(dir, Options::default()).unwrap();
+        let flush = |e: &Engine| e.flush(&mut e.state.write().unwrap()).unwrap();
+        e.put(b"a", b"a1").unwrap();
+        e.put(b"b", b"b1").unwrap();
+        e.put(b"gone", b"x").unwrap();
+        flush(&e);
+        e.put(b"a", b"a2").unwrap();
+        e.put(b"c", b"c2").unwrap();
+        e.delete(b"gone").unwrap();
+        flush(&e);
+        e.put(b"b", b"b3").unwrap();
+        flush(&e);
+        e
+    }
+
+    fn check_compacted(e: &Engine) {
+        for (k, v) in [("a", Some("a2")), ("b", Some("b3")), ("c", Some("c2")), ("gone", None)] {
+            assert_eq!(e.get(k.as_bytes()).unwrap(), v.map(|v| v.as_bytes().to_vec()), "{k}");
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_newest_values_and_drops_tombstones() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = three_tables(dir.path());
+        e.compact(&mut e.state.write().unwrap()).unwrap();
+        {
+            let state = e.state.read().unwrap();
+            let [(seq, table)] = &state.sstables[..] else { panic!("{} tables after compaction", state.sstables.len()) };
+            assert_eq!((*seq, table.compacted_through()), (4, 3));
+            assert!(table.keys().eq([&b"a"[..], b"b", b"c"]), "the tombstone for \"gone\" is still there");
+        }
+        assert_eq!(sst_count(dir.path()), 1);
+        check_compacted(&e);
+        drop(e);
+        check_compacted(&Engine::open(dir.path(), Options::default()).unwrap());
+    }
+
+    #[test]
+    fn crash_before_compaction_deletes_never_resurrects_a_deleted_key() {
+        // All inputs left behind, or only the oldest one that still holds "gone" = x: a crash partway
+        // through the deletes, or power loss undoing some of them, can leave any subset.
+        for left_behind in [3, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let e = three_tables(dir.path());
+            let old: Vec<_> = (1..=left_behind).map(|seq| (sst_path(dir.path(), seq), fs::read(sst_path(dir.path(), seq)).unwrap())).collect();
+            e.compact(&mut e.state.write().unwrap()).unwrap();
+            drop(e);
+            for (path, bytes) in &old {
+                fs::write(path, bytes).unwrap();
+            }
+
+            let e = Engine::open(dir.path(), Options::default()).unwrap();
+            check_compacted(&e);
+            assert!(old.iter().all(|(path, _)| !path.exists()), "{left_behind} left behind: old files survived open");
+            assert_eq!(sst_count(dir.path()), 1);
+        }
+    }
+
+    #[test]
+    fn read_error_mid_merge_renames_nothing_and_deletes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = three_tables(dir.path());
+        // Table 2 holds the newest "a" and "c", so the merge has to read values from it.
+        fs::OpenOptions::new().write(true).open(sst_path(dir.path(), 2)).unwrap().set_len(0).unwrap();
+        assert!(e.compact(&mut e.state.write().unwrap()).is_err());
+        assert!(!sst_path(dir.path(), 4).exists());
+        assert_eq!(sst_count(dir.path()), 3);
+    }
+
+    #[test]
+    fn a_flush_past_max_sstables_compacts() {
+        let dir = tempfile::tempdir().unwrap();
+        // Limit 0: every write flushes.
+        let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 0, max_sstables: 2 }).unwrap();
+        e.put(b"a", b"1").unwrap();
+        e.put(b"b", b"2").unwrap();
+        assert_eq!(sst_count(dir.path()), 2);
+        e.delete(b"a").unwrap(); // a third table
+        assert_eq!(sst_count(dir.path()), 1);
+        assert_eq!(e.get(b"a").unwrap(), None);
+        assert_eq!(e.get(b"b").unwrap(), Some(b"2".to_vec()));
     }
 }
