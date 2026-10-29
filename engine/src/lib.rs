@@ -4,6 +4,7 @@ pub mod wal;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
+use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
@@ -72,20 +73,31 @@ fn remove_tables(dir: &Path, tables: Vec<(u64, SsTable)>) -> io::Result<()> {
     seqs.into_iter().try_for_each(|seq| fs::remove_file(sst_path(dir, seq)))
 }
 
-/// Streams the live entries of `tables` (newest first) in key order, reading one value at a time.
-/// Per key the newest table wins; a key whose newest entry is a tombstone is skipped.
-// shortcut: finds the smallest key by checking every table, O(tables) per key; use a BinaryHeap if max_sstables grows large.
-fn merge(tables: &[(u64, SsTable)]) -> impl Iterator<Item = io::Result<(&[u8], Value)>> {
-    let mut cursors: Vec<_> = tables.iter().map(|(_, table)| table.keys().peekable()).collect();
+/// Streams the live entries at or after `start` in key order from `memtable` and then `tables` (newest first),
+/// reading one table value at a time. Per key the newest source wins; a key whose newest entry is a tombstone is skipped.
+// shortcut: finds the smallest key by checking every source, O(sources) per key; use a BinaryHeap if max_sstables grows large.
+fn merge<'a>(
+    memtable: &'a BTreeMap<Vec<u8>, Value>,
+    tables: &'a [(u64, SsTable)],
+    start: &'a [u8],
+) -> impl Iterator<Item = io::Result<(&'a [u8], Value)>> {
+    let memtable_keys: Box<dyn Iterator<Item = &'a [u8]> + 'a> =
+        Box::new(memtable.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)).map(|(key, _)| key.as_slice()));
+    let table_keys = tables.iter().map(|(_, table)| Box::new(table.keys(start)) as Box<dyn Iterator<Item = &'a [u8]> + 'a>);
+    let mut cursors: Vec<_> = std::iter::once(memtable_keys).chain(table_keys).map(Iterator::peekable).collect();
     std::iter::from_fn(move || {
         loop {
-            // min_by_key returns the first of equal keys, and the tables are newest first.
+            // min_by_key returns the first of equal keys, and the sources are newest first.
             let (newest, key) =
                 cursors.iter_mut().enumerate().filter_map(|(i, keys)| Some((i, *keys.peek()?))).min_by_key(|&(_, key)| key)?;
             for keys in &mut cursors {
                 keys.next_if_eq(&key);
             }
-            match tables[newest].1.get(key).transpose()? {
+            let entry = match newest {
+                0 => Ok(memtable[key].clone()),
+                i => tables[i - 1].1.get(key).transpose()?,
+            };
+            match entry {
                 Ok(Value::Tombstone) => {}
                 entry => return Some(entry.map(|value| (key, value))),
             }
@@ -193,8 +205,9 @@ impl Engine {
         let tmp = path.with_extension("sst.tmp");
         let through = state.sstables[0].0;
         let mut failed = None;
+        let no_memtable = BTreeMap::new(); // the memtable is still in the WAL, so it stays out of the merged table
         // A read error ends the merge early; checking `failed` keeps that short file from being renamed into place.
-        let entries = merge(&state.sstables).map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
+        let entries = merge(&no_memtable, &state.sstables, b"").map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
         sstable::write(&tmp, entries, through)?;
         if let Some(e) = failed {
             return Err(e);
@@ -220,6 +233,24 @@ impl Engine {
             Some(Value::Value(v)) => Some(v),
             Some(Value::Tombstone) | None => None,
         })
+    }
+
+    /// Live entries with keys >= `start` in byte order, newest value per key, all read under one read lock.
+    /// Stops after `limit` entries, or before an entry that would take the key and value bytes past `max_bytes`,
+    /// but always returns the first entry. `more` is true only if another live key follows the last one returned.
+    #[allow(clippy::type_complexity)]
+    pub fn scan(&self, start: &[u8], limit: usize, max_bytes: usize) -> io::Result<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+        let state = self.state.read().unwrap();
+        let (mut items, mut bytes) = (Vec::new(), 0);
+        for entry in merge(&state.memtable, &state.sstables, start) {
+            let (key, Value::Value(value)) = entry? else { unreachable!("merge skips tombstones") };
+            bytes += key.len() + value.len();
+            if items.len() == limit || (bytes > max_bytes && !items.is_empty()) {
+                return Ok((items, true));
+            }
+            items.push((key.to_vec(), value));
+        }
+        Ok((items, false))
     }
 }
 
@@ -348,8 +379,54 @@ pub unsafe extern "C" fn patina_get(
     .unwrap_or(ERR)
 }
 
+/// Scans live keys >= `start` (see `Engine::scan`): at most `limit` entries, clamped to 1..=1000, and about 4 MiB
+/// of keys and values. On OK, `*out`/`*out_len` hold a Rust-owned buffer the caller must release with `patina_free`,
+/// little-endian: [count u32][more u8: 0 or 1] then count x [key_len u32][key][value_len u32][value].
+///
 /// # Safety
-/// `buf` and `len` must be null or exactly what one `patina_get` call returned, and each buffer is freed once.
+/// `engine` must be null or an open handle; `start` must point to `start_len` readable bytes;
+/// `out` and `out_len` must be null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn patina_scan(
+    engine: *const Engine,
+    start: *const u8,
+    start_len: usize,
+    limit: u32,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> i32 {
+    if engine.is_null() || out.is_null() || out_len.is_null() {
+        return ERR;
+    }
+    catch_unwind(AssertUnwindSafe(|| unsafe {
+        match (*engine).scan(bytes(start, start_len), limit.clamp(1, 1000) as usize, 4 * 1024 * 1024) {
+            Ok((items, more)) => {
+                let mut buf = Vec::with_capacity(5 + items.iter().map(|(k, v)| 8 + k.len() + v.len()).sum::<usize>());
+                buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
+                buf.push(more as u8);
+                // Keys and values fit in u32: the WAL rejects records over MAX_RECORD (4 MiB).
+                for (key, value) in &items {
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
+                    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(value);
+                }
+                let buf = buf.into_boxed_slice();
+                *out_len = buf.len();
+                *out = Box::into_raw(buf) as *mut u8;
+                OK
+            }
+            Err(e) => {
+                eprintln!("patina_scan: {e}");
+                ERR
+            }
+        }
+    }))
+    .unwrap_or(ERR)
+}
+
+/// # Safety
+/// `buf` and `len` must be null or exactly what one `patina_get` or `patina_scan` call returned, and each buffer is freed once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_free(buf: *mut u8, len: usize) {
     if !buf.is_null() {
@@ -595,7 +672,7 @@ mod tests {
             let state = e.state.read().unwrap();
             let [(seq, table)] = &state.sstables[..] else { panic!("{} tables after compaction", state.sstables.len()) };
             assert_eq!((*seq, table.compacted_through()), (4, 3));
-            assert!(table.keys().eq([&b"a"[..], b"b", b"c"]), "the tombstone for \"gone\" is still there");
+            assert!(table.keys(b"").eq([&b"a"[..], b"b", b"c"]), "the tombstone for \"gone\" is still there");
         }
         assert_eq!(sst_count(dir.path()), 1);
         check_compacted(&e);
@@ -647,5 +724,136 @@ mod tests {
         assert_eq!(sst_count(dir.path()), 1);
         assert_eq!(e.get(b"a").unwrap(), None);
         assert_eq!(e.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    /// `three_tables` plus a memtable that overwrites "c", deletes "b" and adds "d". Live: a=a2, c=c4, d=d4.
+    fn tables_and_memtable(dir: &Path) -> Engine {
+        let e = three_tables(dir);
+        e.put(b"c", b"c4").unwrap();
+        e.delete(b"b").unwrap();
+        e.put(b"d", b"d4").unwrap();
+        e
+    }
+
+    /// `e.scan` without a byte cap, as space-separated "key=value" pairs.
+    fn scan(e: &Engine, start: &str, limit: usize) -> (String, bool) {
+        let (items, more) = e.scan(start.as_bytes(), limit, usize::MAX).unwrap();
+        let items: Vec<_> =
+            items.iter().map(|(k, v)| format!("{}={}", String::from_utf8_lossy(k), String::from_utf8_lossy(v))).collect();
+        (items.join(" "), more)
+    }
+
+    #[test]
+    fn scan_empty_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        assert_eq!(scan(&e, "", 10), ("".into(), false));
+    }
+
+    #[test]
+    fn scan_merges_memtable_and_sstables_from_any_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tables_and_memtable(dir.path());
+        for start in ["", "0", "a"] {
+            assert_eq!(scan(&e, start, 10), ("a=a2 c=c4 d=d4".into(), false), "start {start:?}");
+        }
+        assert_eq!(scan(&e, "a\0", 10), ("c=c4 d=d4".into(), false)); // just after "a"
+        assert_eq!(scan(&e, "bb", 10), ("c=c4 d=d4".into(), false));
+        assert_eq!(scan(&e, "d", 10), ("d=d4".into(), false));
+        for start in ["e", "z"] {
+            assert_eq!(scan(&e, start, 10), ("".into(), false), "start {start:?}");
+        }
+    }
+
+    #[test]
+    fn scan_skips_tombstones_over_older_sstable_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tables_and_memtable(dir.path());
+        // "b": memtable tombstone over b3 and b1 in tables; "gone": table tombstone over x in an older table.
+        assert_eq!(scan(&e, "b", 10), ("c=c4 d=d4".into(), false));
+        assert_eq!(scan(&e, "gone", 10), ("".into(), false));
+    }
+
+    #[test]
+    fn scan_limit_sets_more_only_if_a_live_key_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tables_and_memtable(dir.path());
+        assert_eq!(scan(&e, "", 2), ("a=a2 c=c4".into(), true));
+        assert_eq!(scan(&e, "", 1), ("a=a2".into(), true)); // the next key "b" is deleted; "c" is what makes more true
+        assert_eq!(scan(&e, "", 3), ("a=a2 c=c4 d=d4".into(), false)); // only the deleted "gone" follows
+        assert_eq!(scan(&e, "c", 2), ("c=c4 d=d4".into(), false));
+    }
+
+    #[test]
+    fn scan_byte_cap_stops_early_but_returns_at_least_one_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = tables_and_memtable(dir.path());
+        // Every live entry is 3 key and value bytes.
+        let page = |max_bytes| {
+            let (items, more) = e.scan(b"", 10, max_bytes).unwrap();
+            (items.len(), more)
+        };
+        assert_eq!(page(0), (1, true));
+        assert_eq!(page(5), (1, true));
+        assert_eq!(page(6), (2, true));
+        assert_eq!(page(9), (3, false));
+    }
+
+    /// Calls `patina_scan`, frees the buffer, and decodes it into "key=value" strings and `more`.
+    unsafe fn ffi_scan(e: *const Engine, start: &[u8], limit: u32) -> (Vec<String>, bool) {
+        let (mut out, mut out_len) = (ptr::null_mut(), 0usize);
+        assert_eq!(unsafe { patina_scan(e, start.as_ptr(), start.len(), limit, &mut out, &mut out_len) }, OK);
+        let buf = unsafe { std::slice::from_raw_parts(out, out_len) }.to_vec();
+        unsafe { patina_free(out, out_len) };
+        let mut rest = &buf[..];
+        let mut take = |n: usize| {
+            let (head, tail) = rest.split_at(n);
+            rest = tail;
+            head
+        };
+        let count = u32::from_le_bytes(take(4).try_into().unwrap());
+        let more = take(1)[0];
+        let items = (0..count)
+            .map(|_| {
+                let mut field = || {
+                    let len = u32::from_le_bytes(take(4).try_into().unwrap()) as usize;
+                    String::from_utf8(take(len).to_vec()).unwrap()
+                };
+                format!("{}={}", field(), field())
+            })
+            .collect();
+        assert!(rest.is_empty(), "{} bytes after the last entry", rest.len());
+        assert!(more <= 1, "more = {more}");
+        (items, more == 1)
+    }
+
+    #[test]
+    fn ffi_scan_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        // 1002 keys written straight to an SSTable, so the test doesn't pay one WAL sync per key.
+        let key = |i: u32| format!("k{i:04}");
+        let entries = (0..1002).map(|i| (key(i), Value::Value(i.to_string().into_bytes())));
+        sstable::write(&sst_path(dir.path(), 1), entries, 0).unwrap();
+        let path = dir.path().to_str().unwrap();
+        unsafe {
+            let e = patina_open(path.as_ptr(), path.len());
+            assert!(!e.is_null());
+            let (k, v) = (b"k0001", b"new");
+            assert_eq!(patina_put(e, k.as_ptr(), k.len(), v.as_ptr(), v.len()), OK);
+            assert_eq!(patina_delete(e, b"k0002".as_ptr(), 5), OK);
+
+            assert_eq!(ffi_scan(e, b"", 3), (vec!["k0000=0".into(), "k0001=new".into(), "k0003=3".into()], true));
+            assert_eq!(ffi_scan(e, b"k1001", 3), (vec!["k1001=1001".into()], false));
+            assert_eq!(ffi_scan(e, b"l", 3), (vec![], false));
+            assert_eq!(ffi_scan(e, b"", 0), (vec!["k0000=0".into()], true)); // clamped up to 1
+            // 1001 live keys, clamped down to 1000.
+            let (items, more) = ffi_scan(e, b"", u32::MAX);
+            assert_eq!((items.len(), items.last().map(String::as_str), more), (1000, Some("k1000=1000"), true));
+
+            let (mut out, mut out_len) = (ptr::null_mut(), 0usize);
+            assert_eq!(patina_scan(ptr::null(), ptr::null(), 0, 10, &mut out, &mut out_len), ERR);
+            assert_eq!(patina_scan(e, ptr::null(), 0, 10, ptr::null_mut(), &mut out_len), ERR);
+            patina_close(e);
+        }
     }
 }

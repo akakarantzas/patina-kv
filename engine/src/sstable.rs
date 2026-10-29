@@ -6,6 +6,7 @@ use std::borrow::Borrow;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -132,9 +133,9 @@ impl SsTable {
         Ok(Some(Value::Value(value)))
     }
 
-    /// Every key, tombstones included, in ascending byte order.
-    pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
-        self.index.keys().map(Vec::as_slice)
+    /// Every key at or after `start`, tombstones included, in ascending byte order.
+    pub fn keys(&self, start: &[u8]) -> impl Iterator<Item = &[u8]> {
+        self.index.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)).map(|(key, _)| key.as_slice())
     }
 
     pub fn compacted_through(&self) -> u64 {
@@ -201,7 +202,7 @@ mod tests {
         for (key, value) in entries.iter().rev() {
             assert_eq!(table.get(key).unwrap().as_ref(), Some(value));
         }
-        assert!(table.keys().eq(entries.iter().map(|(k, _)| *k)));
+        assert!(table.keys(b"").eq(entries.iter().map(|(k, _)| *k)));
         assert_eq!(table.compacted_through(), 7);
     }
 
@@ -209,7 +210,7 @@ mod tests {
     fn empty_table() {
         let (_dir, path) = write_file(&[]);
         let table = SsTable::open(&path).unwrap();
-        assert_eq!(table.keys().count(), 0);
+        assert_eq!(table.keys(b"").count(), 0);
         assert_eq!(table.get(b"").unwrap(), None);
         assert_eq!(table.compacted_through(), 7);
         assert_eq!(fs::metadata(&path).unwrap().len(), FOOTER_LEN);
