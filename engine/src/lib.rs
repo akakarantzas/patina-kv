@@ -90,6 +90,9 @@ unsafe fn bytes<'a>(p: *const u8, len: usize) -> &'a [u8] {
 }
 
 /// `path` is a UTF-8 data directory path. Returns null on failure, with the reason on stderr. Release with `patina_close`.
+///
+/// # Safety
+/// `path` must point to `path_len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_open(path: *const u8, path_len: usize) -> *mut Engine {
     catch_unwind(AssertUnwindSafe(|| {
@@ -111,6 +114,8 @@ pub unsafe extern "C" fn patina_open(path: *const u8, path_len: usize) -> *mut E
     .unwrap_or(ptr::null_mut())
 }
 
+/// # Safety
+/// `engine` must be null or a handle from `patina_open`; no other call on it may be running or start after this one.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_close(engine: *mut Engine) {
     if !engine.is_null() {
@@ -118,6 +123,8 @@ pub unsafe extern "C" fn patina_close(engine: *mut Engine) {
     }
 }
 
+/// # Safety
+/// `engine` must be null or an open handle; `key` and `value` must point to `key_len` and `value_len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_put(
     engine: *const Engine,
@@ -142,6 +149,9 @@ pub unsafe extern "C" fn patina_put(
 }
 
 /// OK also when the key does not exist.
+///
+/// # Safety
+/// `engine` must be null or an open handle; `key` must point to `key_len` readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_delete(engine: *const Engine, key: *const u8, key_len: usize) -> i32 {
     if engine.is_null() {
@@ -160,6 +170,10 @@ pub unsafe extern "C" fn patina_delete(engine: *const Engine, key: *const u8, ke
 }
 
 /// On OK, `*out`/`*out_len` hold a Rust-owned buffer the caller must release with `patina_free`.
+///
+/// # Safety
+/// `engine` must be null or an open handle; `key` must point to `key_len` readable bytes;
+/// `out` and `out_len` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_get(
     engine: *const Engine,
@@ -185,6 +199,8 @@ pub unsafe extern "C" fn patina_get(
     .unwrap_or(ERR)
 }
 
+/// # Safety
+/// `buf` and `len` must be null or exactly what one `patina_get` call returned, and each buffer is freed once.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn patina_free(buf: *mut u8, len: usize) {
     if !buf.is_null() {

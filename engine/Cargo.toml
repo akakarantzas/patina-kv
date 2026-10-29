@@ -2,6 +2,7 @@
 name = "patina-engine"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 
 [lib]
 # cdylib: the .dll/.so/.dylib Java loads; rlib: lets `cargo test` link the crate.
