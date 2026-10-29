@@ -1,4 +1,5 @@
-//! Kill-the-process test (PLAN.md phase 1a): no acknowledged write is lost when the process dies.
+//! Kill-the-process test (PLAN.md phases 1 and 2): no acknowledged write is lost when the process dies,
+//! including mid-flush: the tiny memtable limit makes the child flush every few writes.
 // A process kill doesn't test power loss; the torn-write test in wal.rs and fsync-before-ack cover that.
 
 use std::io::{BufRead, BufReader, Write};
@@ -7,10 +8,14 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use patina_engine::Engine;
+use patina_engine::{Engine, Options};
 
 /// Caps the child, so one orphaned by a dead parent can't fill the disk.
 const WRITES: u32 = 100_000;
+
+fn tiny() -> Options {
+    Options { memtable_limit_bytes: 100 }
+}
 
 fn key(i: u32) -> [u8; 4] {
     i.to_be_bytes()
@@ -30,7 +35,7 @@ fn is_deleted(i: u32) -> bool {
 #[ignore]
 fn child_writer() {
     let Some(dir) = std::env::var_os("PATINA_CRASH_DIR") else { return };
-    let engine = Engine::open(Path::new(&dir)).unwrap();
+    let engine = Engine::open(Path::new(&dir), tiny()).unwrap();
     for i in 0..WRITES {
         engine.put(&key(i), &value(i)).unwrap();
         if is_deleted(i) {
@@ -43,6 +48,7 @@ fn child_writer() {
 
 #[test]
 fn no_acked_write_lost_on_kill() {
+    let mut iterations_with_sstables = 0;
     for iteration in 0..100 {
         let tmp = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -76,10 +82,13 @@ fn no_acked_write_lost_on_kill() {
         reader.join().unwrap();
         let last_ack = acks.try_iter().last().unwrap_or(first);
 
+        let flushed = std::fs::read_dir(tmp.path()).unwrap().any(|e| e.unwrap().path().extension().is_some_and(|x| x == "sst"));
+        iterations_with_sstables += usize::from(flushed);
+
         // The child writes only keys 0..WRITES, so probing that range finds any key it could have left behind.
-        let engine = Engine::open(tmp.path()).unwrap();
+        let engine = Engine::open(tmp.path(), tiny()).unwrap();
         let bad = (0..WRITES).find(|&i| {
-            let got = engine.get(&key(i));
+            let got = engine.get(&key(i)).unwrap();
             if i > last_ack + 1 {
                 got.is_some()
             } else if i == last_ack + 1 {
@@ -91,11 +100,13 @@ fn no_acked_write_lost_on_kill() {
             }
         });
         if let Some(i) = bad {
-            let got = engine.get(&key(i)).map(|v| String::from_utf8_lossy(&v).into_owned());
+            let got = engine.get(&key(i)).unwrap().map(|v| String::from_utf8_lossy(&v).into_owned());
             panic!(
                 "iteration {iteration}: first bad key is {i} (got {got:?}, last ack {last_ack}), dir {}",
                 tmp.keep().display()
             );
         }
     }
+    // Otherwise the kills never met a flush and the test proved nothing about it.
+    assert!(iterations_with_sstables > 0, "no iteration flushed an SSTable");
 }
