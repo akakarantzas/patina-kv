@@ -1,3 +1,4 @@
+pub mod sstable;
 pub mod wal;
 
 use std::collections::BTreeMap;
