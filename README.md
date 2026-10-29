@@ -18,9 +18,13 @@ cd service
 ```bash
 curl -X PUT localhost:8080/items/user1 -H "Content-Type: text/plain" -d alice
 curl localhost:8080/items/user1
+curl "localhost:8080/items?limit=50"
+curl -X DELETE localhost:8080/items/user1
 ```
 
-Data lives in `service/data/` (override with `--patina.data-dir=...`); delete it for a clean start.
+`GET /items` lists keys in byte order, up to `limit` per page (1–1000, default 50): `{"items":[{"key":"user1","value":"YWxpY2U="}],"next":null}`, with values in base64. When `next` isn't `null`, pass it back as `?after=` (URL-encoded) for the next page.
+
+Data lives in `service/data/` (override with `./gradlew bootRun --args='--patina.data-dir=...'`); delete it for a clean start.
 
 Rust tests alone: `cd engine && cargo test`.
 
