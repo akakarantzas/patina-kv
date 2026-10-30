@@ -956,6 +956,8 @@ mod tests {
         let tables: Vec<_> = e.state.read().unwrap().sstables.iter().map(|(_, table)| Arc::clone(table)).collect();
         let files: Vec<_> = tables.iter().map(|table| table.file.lock().unwrap()).collect();
         f();
+        // While the compaction is still stuck: a flush that ends after its handle is taken out would start a second one.
+        e.wait_for_flush().unwrap();
         assert!(e.state.read().unwrap().compaction.as_ref().is_some_and(|c| !c.is_finished()), "no compaction is running");
         drop(files);
         drop(tables);
@@ -976,7 +978,6 @@ mod tests {
             assert_eq!(e.get(b"d").unwrap(), Some(b"4".to_vec()));
         })
         .unwrap();
-        e.wait_for_flush().unwrap();
         // "d", then the merge of tables 1-3 at the seq reserved before "d" was sealed.
         let seqs: Vec<_> = e.state.read().unwrap().sstables.iter().map(|&(seq, _)| seq).collect();
         assert_eq!(seqs, [5, 4]);
