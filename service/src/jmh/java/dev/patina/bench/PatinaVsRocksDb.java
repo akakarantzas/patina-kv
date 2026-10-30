@@ -36,7 +36,7 @@ import org.rocksdb.WriteOptions;
  * Keys are 8-byte big-endian longs, so byte order is numeric order; values are random bytes of valueSize.
  *
  * <p>Patina settings: Options::default() from engine/src/lib.rs, that is a 4 MiB memtable limit and a full
- * compaction, inside the write that triggers it, once there are more than 4 SSTables; sync_writes = sync.
+ * compaction, on a background thread the triggering write starts, once there are more than 4 SSTables; sync_writes = sync.
  * Patina has no compression, no bloom filters and no block cache.
  *
  * <p>RocksDB settings, every one this benchmark sets:

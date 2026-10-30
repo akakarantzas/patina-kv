@@ -32,7 +32,8 @@ import org.openjdk.jmh.infra.Blackhole;
  *
  * <p>Patina put runs with sync_writes off: each put writes its WAL record to the OS, without fsync. Overwrites
  * count toward the 4 MiB memtable limit, so every ~4 MiB of puts also flushes a one-entry SSTable (that flush
- * does fsync), and once more than 4 SSTables exist the flush also compacts; that cost is amortized into the put number.
+ * does fsync), and once more than 4 SSTables exist the flush also starts a background compaction; that cost is amortized
+ * into the put number.
  */
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.NANOSECONDS)
