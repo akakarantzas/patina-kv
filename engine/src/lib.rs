@@ -259,7 +259,7 @@ impl Engine {
 }
 
 // ---- C ABI used by service/src/main/java/dev/patina/engine/PatinaEngine.java ----
-// Every entry point catches panics: unwinding into the JVM is undefined behaviour.
+// Every entry point except patina_free (it only drops a byte buffer, which can't panic) catches panics: unwinding into the JVM is undefined behaviour.
 
 pub const OK: i32 = 0;
 pub const NOT_FOUND: i32 = 1;
