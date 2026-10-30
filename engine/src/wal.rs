@@ -88,17 +88,6 @@ impl Wal {
         self.failed = result.is_err();
         result
     }
-
-    /// Empties the log once its records are safe elsewhere. Returns Ok only once the empty log is on disk.
-    pub fn reset(&mut self) -> io::Result<()> {
-        // Truncate before seeking: appends at offset 0 over old records could replay them after the new ones.
-        // A failed truncate changes nothing, so appends stay safe.
-        self.file.set_len(0)?;
-        let result = self.file.seek(SeekFrom::Start(0)).and_then(|_| self.file.sync_all());
-        // Like a failed append: the log's state is unknown, so block appends until it is reopened.
-        self.failed = result.is_err();
-        result
-    }
 }
 
 /// The record at the start of `buf` and its encoded length; None if it is incomplete or corrupt.
@@ -265,33 +254,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         drop(wal);
         assert_eq!(Wal::open(&path).unwrap().1, [at_limit]);
-    }
-
-    #[test]
-    fn reset_empties_the_log_and_appends_start_over() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal.log");
-        let (mut wal, _) = Wal::open(&path).unwrap();
-        wal.append(&put(b"old", &[1; 100])).unwrap();
-        wal.reset().unwrap();
-        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
-        wal.append(&put(b"new", b"2")).unwrap();
-        drop(wal);
-        assert_eq!(Wal::open(&path).unwrap().1, [put(b"new", b"2")]);
-    }
-
-    #[test]
-    fn failed_truncate_leaves_the_log_usable() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal.log");
-        let (mut wal, _) = Wal::open(&path).unwrap();
-        wal.append(&put(b"a", b"1")).unwrap();
-        let writable = std::mem::replace(&mut wal.file, File::open(&path).unwrap()); // read-only, so set_len fails
-        assert!(wal.reset().is_err());
-        wal.file = writable;
-        wal.append(&put(b"b", b"2")).unwrap();
-        drop(wal);
-        assert_eq!(Wal::open(&path).unwrap().1, [put(b"a", b"1"), put(b"b", b"2")]);
     }
 
     #[test]

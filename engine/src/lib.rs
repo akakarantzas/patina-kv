@@ -8,7 +8,7 @@ use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use sstable::SsTable;
@@ -17,13 +17,19 @@ use wal::{Record, Wal};
 pub struct Engine {
     dir: PathBuf,
     options: Options,
-    /// Shared with the compaction thread.
+    /// Shared with the flush and compaction threads.
     state: Arc<RwLock<State>>,
+    /// Held by the write that seals the memtable, so one write at a time waits for a running flush or retries a failed one.
+    sealing: Mutex<()>,
+    /// Tests hold this to stop a flush before it writes anything.
+    #[cfg(test)]
+    flush_gate: Arc<Mutex<()>>,
 }
 
 /// Engine settings; the C ABI sets only `sync_writes` and keeps the other defaults.
 pub struct Options {
-    /// A write that takes the bytes written since the last flush past this flushes the memtable to an SSTable.
+    /// A write that takes the memtable past this seals it behind a fresh one and flushes it to an SSTable on a
+    /// background thread. A write that fills the fresh one before that flush ends waits for it.
     pub memtable_limit_bytes: usize,
     /// A flush that leaves more SSTables than this starts merging them all into one on a background thread.
     pub max_sstables: usize,
@@ -48,14 +54,36 @@ pub enum Value {
 // The WAL shares the memtable's lock, so WAL order always matches memtable order.
 struct State {
     memtable: BTreeMap<Vec<u8>, Value>,
-    /// Key and value bytes written since the last flush. Overwrites count again, so this also bounds the WAL size.
+    /// Key and value bytes written to the memtable. Overwrites count again, so this also bounds its WALs' size.
     memtable_bytes: usize,
     wal: Wal,
+    /// The WALs holding the memtable's records, oldest first; `wal` appends to the last one.
+    wal_paths: Vec<PathBuf>,
+    next_wal: u64,
+    /// The sealed memtable a flush is writing out; at most one at a time.
+    immutable: Option<Immutable>,
     /// (seq, table), newest seq first. Tables are immutable, so a compaction reads its inputs outside the lock.
     sstables: Vec<(u64, Arc<SsTable>)>,
     next_seq: u64,
+    /// The running or last flush.
+    flush: Option<JoinHandle<io::Result<()>>>,
     /// The running or last compaction; at most one runs at a time.
     compaction: Option<JoinHandle<io::Result<()>>>,
+}
+
+/// A sealed memtable, the seq reserved for its SSTable, and the WALs holding its records.
+#[derive(Clone)]
+struct Immutable {
+    seq: u64,
+    memtable: Arc<BTreeMap<Vec<u8>, Value>>,
+    wals: Vec<PathBuf>,
+}
+
+impl State {
+    /// The memtable, then the immutable one if any: newest first.
+    fn memtables(&self) -> impl Iterator<Item = &BTreeMap<Vec<u8>, Value>> {
+        std::iter::once(&self.memtable).chain(self.immutable.as_ref().map(|immutable| &*immutable.memtable))
+    }
 }
 
 /// Applies `record` to the memtable and returns the key and value bytes it wrote.
@@ -73,6 +101,10 @@ fn sst_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{seq:06}.sst"))
 }
 
+fn wal_path(dir: &Path, n: u64) -> PathBuf {
+    dir.join(format!("{n:06}.wal"))
+}
+
 /// Closes `tables`, then deletes their files: Windows can't fully delete a file that is still open,
 /// so the caller must hold no other handle to them.
 fn remove_tables(dir: &Path, tables: Vec<(u64, Arc<SsTable>)>) -> io::Result<()> {
@@ -81,18 +113,21 @@ fn remove_tables(dir: &Path, tables: Vec<(u64, Arc<SsTable>)>) -> io::Result<()>
     seqs.into_iter().try_for_each(|seq| fs::remove_file(sst_path(dir, seq)))
 }
 
-/// Streams the live entries at or after `start` in key order from `memtable` and then `tables` (newest first),
+/// Streams the live entries at or after `start` in key order from `memtables` and then `tables`, each newest first,
 /// reading one table value at a time. Per key the newest source wins; a key whose newest entry is a tombstone is skipped.
 // shortcut: finds the smallest key by checking every source, O(sources) per key; use a BinaryHeap if the table count grows large.
 fn merge<'a>(
-    memtable: &'a BTreeMap<Vec<u8>, Value>,
+    memtables: impl IntoIterator<Item = &'a BTreeMap<Vec<u8>, Value>>,
     tables: &'a [(u64, Arc<SsTable>)],
     start: &'a [u8],
 ) -> impl Iterator<Item = io::Result<(&'a [u8], Value)>> {
-    let memtable_keys: Box<dyn Iterator<Item = &'a [u8]> + 'a> =
-        Box::new(memtable.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)).map(|(key, _)| key.as_slice()));
+    let memtables: Vec<_> = memtables.into_iter().collect();
+    let memtable_keys = memtables.iter().map(|&memtable| {
+        Box::new(memtable.range::<[u8], _>((Bound::Included(start), Bound::Unbounded)).map(|(key, _)| key.as_slice()))
+            as Box<dyn Iterator<Item = &'a [u8]> + 'a>
+    });
     let table_keys = tables.iter().map(|(_, table)| Box::new(table.keys(start)) as Box<dyn Iterator<Item = &'a [u8]> + 'a>);
-    let mut cursors: Vec<_> = std::iter::once(memtable_keys).chain(table_keys).map(Iterator::peekable).collect();
+    let mut cursors: Vec<_> = memtable_keys.chain(table_keys).map(Iterator::peekable).collect();
     std::iter::from_fn(move || {
         loop {
             // min_by_key returns the first of equal keys, and the sources are newest first.
@@ -101,9 +136,9 @@ fn merge<'a>(
             for keys in &mut cursors {
                 keys.next_if_eq(&key);
             }
-            let entry = match newest {
-                0 => Ok(memtable[key].clone()),
-                i => tables[i - 1].1.get(key).transpose()?,
+            let entry = match memtables.get(newest) {
+                Some(memtable) => Ok(memtable[key].clone()),
+                None => tables[newest - memtables.len()].1.get(key).transpose()?,
             };
             match entry {
                 Ok(Value::Tombstone) => {}
@@ -115,7 +150,7 @@ fn merge<'a>(
 
 impl Engine {
     /// Creates `dir` if needed, deletes leftover `*.tmp` files, opens its `<seq>.sst` files, deletes the ones
-    /// a compaction already merged, and replays `<dir>/wal.log` into the memtable.
+    /// a compaction already merged, and replays every `<n>.wal` into the memtable, oldest first.
     /// shortcut: no lock file, so two processes opening the same dir corrupt each other's WAL; add one before running more than one instance.
     pub fn open(dir: &Path, options: Options) -> io::Result<Engine> {
         fs::create_dir_all(dir)?;
@@ -125,17 +160,21 @@ impl Engine {
             let parent = dir.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
             fs::File::open(parent)?.sync_all()?;
         }
-        let mut tables = BTreeMap::new();
+        let (mut tables, mut wals) = (BTreeMap::new(), BTreeMap::new());
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
             match path.extension().and_then(|e| e.to_str()) {
-                // A flush that never reached its rename; the WAL is reset only after the rename, so it still holds the data.
+                // A flush that never reached its rename; its WALs are deleted only after the rename, so they still hold the data.
                 Some("tmp") => fs::remove_file(&path)?,
-                Some("sst") => {
-                    let seq = path.file_stem().and_then(|s| s.to_str()?.parse::<u64>().ok()).ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("unexpected SSTable name {}", path.display()))
+                Some(ext @ ("sst" | "wal")) => {
+                    let n = path.file_stem().and_then(|s| s.to_str()?.parse::<u64>().ok()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("unexpected file name {}", path.display()))
                     })?;
-                    tables.insert(seq, path);
+                    if ext == "sst" { tables.insert(n, path) } else { wals.insert(n, path) };
+                }
+                // The single WAL of an engine from before WALs were numbered, older than any numbered one.
+                Some("log") if path.ends_with("wal.log") => {
+                    wals.insert(0, path);
                 }
                 _ => {}
             }
@@ -149,15 +188,41 @@ impl Engine {
         let merged = sstables.split_off(sstables.partition_point(|&(seq, _)| seq > through));
         remove_tables(dir, merged)?;
 
-        let (mut wal, records) = Wal::open(&dir.join("wal.log"))?;
-        wal.sync = options.sync_writes;
-        let mut memtable = BTreeMap::new();
-        let mut memtable_bytes = 0;
-        for record in records {
-            memtable_bytes += apply(&mut memtable, record);
+        if wals.is_empty() {
+            wals.insert(1, wal_path(dir, 1)); // a new dir starts its first WAL
         }
-        let state = State { memtable, memtable_bytes, wal, sstables, next_seq, compaction: None };
-        Ok(Engine { dir: dir.to_path_buf(), options, state: Arc::new(RwLock::new(state)) })
+        let next_wal = wals.keys().next_back().unwrap() + 1;
+        let (mut memtable, mut memtable_bytes, mut wal) = (BTreeMap::new(), 0, None);
+        for path in wals.values() {
+            let (log, records) = Wal::open(path)?;
+            for record in records {
+                memtable_bytes += apply(&mut memtable, record);
+            }
+            wal = Some(log); // only the newest stays open: appends go to it
+        }
+        let mut wal = wal.unwrap();
+        wal.sync = options.sync_writes;
+        let wal_paths = wals.into_values().collect();
+        let state = State {
+            memtable,
+            memtable_bytes,
+            wal,
+            wal_paths,
+            next_wal,
+            immutable: None,
+            sstables,
+            next_seq,
+            flush: None,
+            compaction: None,
+        };
+        Ok(Engine {
+            dir: dir.to_path_buf(),
+            options,
+            state: Arc::new(RwLock::new(state)),
+            sealing: Mutex::new(()),
+            #[cfg(test)]
+            flush_gate: Arc::default(),
+        })
     }
 
     /// Returns Ok only once the write is on disk (with `sync_writes` off: once the OS has it); on error the memtable is unchanged.
@@ -175,45 +240,102 @@ impl Engine {
         state.wal.append(&record)?;
         state.memtable_bytes += apply(&mut state.memtable, record);
         if state.memtable_bytes > self.options.memtable_limit_bytes {
-            // The write is already durable in the WAL, so a failed flush or compaction must not fail it; the next flush retries.
-            if let Err(e) = self.flush(&mut state) {
-                eprintln!("patina: flush to an SSTable failed, retrying on the next write: {e}");
-            } else if state.sstables.len() > self.options.max_sstables {
-                self.start_compaction(&mut state);
+            drop(state);
+            // The write is already durable in the WAL, so failing to seal must not fail it; the next write retries.
+            if let Err(e) = self.seal(self.options.memtable_limit_bytes) {
+                eprintln!("patina: cannot start a new WAL, retrying on the next write: {e}");
             }
         }
         Ok(())
     }
 
-    /// Writes the memtable to the next `<seq>.sst` and then empties the WAL. On error nothing in `state` changes.
-    fn flush(&self, state: &mut State) -> io::Result<()> {
-        let path = sst_path(&self.dir, state.next_seq);
-        let tmp = path.with_extension("sst.tmp");
-        sstable::write(&tmp, &state.memtable, 0)?;
-        fs::rename(&tmp, &path)?;
-        // Same Unix-only rule as wal.rs: the rename must be durable before the WAL stops holding the data.
-        #[cfg(unix)]
-        fs::File::open(&self.dir)?.sync_all()?;
-        let table = Arc::new(SsTable::open(&path)?);
-        // A crash before this reset leaves the data in both places: replay rebuilds exactly this table's entries, which shadow it harmlessly.
-        state.wal.reset()?;
-        state.sstables.insert(0, (state.next_seq, table));
-        state.next_seq += 1;
-        state.memtable.clear();
-        state.memtable_bytes = 0;
+    /// If the memtable holds more than `limit` bytes, seals it behind a fresh memtable and WAL and starts flushing it
+    /// on a background thread. At most one memtable is sealed at a time, so this first waits for the last flush and,
+    /// if that failed, retries it instead. On error nothing in the state changes.
+    fn seal(&self, limit: usize) -> io::Result<()> {
+        let _sealing = self.sealing.lock().unwrap();
+        if self.state.read().unwrap().memtable_bytes <= limit {
+            return Ok(()); // another write sealed it while this one waited for its turn
+        }
+        let _ = self.wait_for_flush(); // the flush thread already printed any error
+        let mut state = self.state.write().unwrap();
+        if state.immutable.is_none() {
+            let path = wal_path(&self.dir, state.next_wal);
+            let (mut wal, _) = Wal::open(&path)?;
+            wal.sync = self.options.sync_writes;
+            state.next_wal += 1;
+            state.wal = wal; // closes the old WAL, which Windows needs before the flush can delete it
+            let wals = std::mem::replace(&mut state.wal_paths, vec![path]);
+            // Reserved now, as a compaction reserves its seq: any table flushed or compacted later gets a higher one.
+            let seq = state.next_seq;
+            state.next_seq += 1;
+            let memtable = Arc::new(std::mem::take(&mut state.memtable));
+            state.memtable_bytes = 0;
+            state.immutable = Some(Immutable { seq, memtable, wals });
+        }
+        // Otherwise the last flush failed and left its memtable sealed.
+        let immutable = state.immutable.clone().unwrap();
+        let (dir, shared, max_sstables) = (self.dir.clone(), Arc::clone(&self.state), self.options.max_sstables);
+        #[cfg(test)]
+        let gate = Arc::clone(&self.flush_gate);
+        let spawned = thread::Builder::new().spawn(move || {
+            #[cfg(test)]
+            drop(gate.lock());
+            Engine::flush(&dir, &shared, immutable, max_sstables)
+                .inspect_err(|e| eprintln!("patina: flush to an SSTable failed, retrying when the memtable fills again: {e}"))
+        });
+        state.flush = spawned.inspect_err(|e| eprintln!("patina: cannot start a flush thread: {e}")).ok();
         Ok(())
+    }
+
+    /// Writes `immutable` to its `<seq>.sst` while reads and writes go on, deletes the WALs that held it, then swaps
+    /// the table in for it and starts a compaction if that leaves more than `max_sstables` tables.
+    fn flush(dir: &Path, shared: &Arc<RwLock<State>>, immutable: Immutable, max_sstables: usize) -> io::Result<()> {
+        let Immutable { seq, memtable, wals } = immutable;
+        let path = sst_path(dir, seq);
+        let tmp = path.with_extension("sst.tmp");
+        sstable::write(&tmp, &*memtable, 0)?;
+        fs::rename(&tmp, &path)?;
+        // Same Unix-only rule as wal.rs: the rename must be durable before the WALs stop holding the data.
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        let table = Arc::new(SsTable::open(&path)?);
+        // A crash before these deletes leaves the data in both places: replay rebuilds exactly this table's entries,
+        // which shadow it harmlessly. They finish before the swap: after it a newer table can exist, which a leftover WAL would hide.
+        for wal in &wals {
+            match fs::remove_file(wal) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e), // NotFound: a retry after a failed delete
+                _ => {}
+            }
+        }
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        let mut state = shared.write().unwrap();
+        state.sstables.insert(0, (seq, table));
+        state.immutable = None;
+        if state.sstables.len() > max_sstables {
+            Engine::start_compaction(dir, shared, &mut state);
+        }
+        Ok(())
+    }
+
+    /// Waits for the running or last flush and returns its result.
+    fn wait_for_flush(&self) -> io::Result<()> {
+        // Taken out under the lock and joined outside it: the flush needs the lock to swap its table in.
+        let flush = self.state.write().unwrap().flush.take();
+        flush.map_or(Ok(()), |f| f.join().unwrap_or_else(|_| Err(io::Error::other("flush thread panicked"))))
     }
 
     /// Starts merging every SSTable into one on a background thread, unless a compaction is already running.
     // shortcut: tables flushed during a merge stay unmerged until it ends, so a long merge under steady writes leaves many tables for every get and scan to check; stall writes above a hard cap if reads must stay fast then.
-    fn start_compaction(&self, state: &mut State) {
+    fn start_compaction(dir: &Path, shared: &Arc<RwLock<State>>, state: &mut State) {
         if state.compaction.as_ref().is_some_and(|c| !c.is_finished()) {
             return;
         }
         // Reserved now, so tables flushed during the merge get higher seqs and stay in front of it after a reopen too.
         let (inputs, seq) = (state.sstables.clone(), state.next_seq);
         state.next_seq += 1;
-        let (dir, shared) = (self.dir.clone(), Arc::clone(&self.state));
+        let (dir, shared) = (dir.to_path_buf(), Arc::clone(shared));
         let spawned = thread::Builder::new()
             .spawn(move || Engine::compact(&dir, &shared, inputs, seq).inspect_err(|e| eprintln!("patina: compaction failed: {e}")));
         state.compaction = spawned.inspect_err(|e| eprintln!("patina: cannot start a compaction thread: {e}")).ok();
@@ -227,9 +349,9 @@ impl Engine {
         let tmp = path.with_extension("sst.tmp");
         let through = inputs[0].0;
         let mut failed = None;
-        let no_memtable = BTreeMap::new(); // the memtable is still in the WAL, so it stays out of the merged table
+        // No memtables: they are newer than every input, and still in their WALs.
         // A read error ends the merge early; checking `failed` keeps that short file from being renamed into place.
-        let entries = merge(&no_memtable, &inputs, b"").map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
+        let entries = merge([], &inputs, b"").map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
         if let Err(e) = sstable::write(&tmp, entries, through).and_then(|()| failed.map_or(Ok(()), Err)) {
             let _ = fs::remove_file(&tmp); // a retry takes a new seq, so nothing else would overwrite this file
             return Err(e);
@@ -258,10 +380,11 @@ impl Engine {
         compaction.map_or(Ok(()), |c| c.join().unwrap_or_else(|_| Err(io::Error::other("compaction thread panicked"))))
     }
 
-    /// Looks in the memtable, then the SSTables newest first. The first entry found wins, so a tombstone hides older values.
+    /// Looks in the memtable, the immutable one, then the SSTables newest first. The first entry found wins, so a
+    /// tombstone hides older values.
     pub fn get(&self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
         let state = self.state.read().unwrap();
-        let found = match state.memtable.get(key) {
+        let found = match state.memtables().find_map(|memtable| memtable.get(key)) {
             Some(entry) => Some(entry.clone()),
             None => state.sstables.iter().find_map(|(_, table)| table.get(key).transpose()).transpose()?,
         };
@@ -278,7 +401,7 @@ impl Engine {
     pub fn scan(&self, start: &[u8], limit: usize, max_bytes: usize) -> io::Result<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
         let state = self.state.read().unwrap();
         let (mut items, mut bytes) = (Vec::new(), 0);
-        for entry in merge(&state.memtable, &state.sstables, start) {
+        for entry in merge(state.memtables(), &state.sstables, start) {
             let (key, Value::Value(value)) = entry? else { unreachable!("merge skips tombstones") };
             bytes += key.len() + value.len();
             if items.len() == limit || (bytes > max_bytes && !items.is_empty()) {
@@ -291,8 +414,9 @@ impl Engine {
 }
 
 impl Drop for Engine {
-    // The compaction thread must not outlive the engine, nor the library holding its code once Java unloads it.
+    // The flush and compaction threads must not outlive the engine, nor the library holding their code once Java unloads it.
     fn drop(&mut self) {
+        let _ = self.wait_for_flush(); // first: a flush can start a compaction
         let _ = self.wait_for_compaction();
     }
 }
@@ -636,22 +760,28 @@ mod tests {
         assert_eq!(e.get(b"k").unwrap(), None);
     }
 
+    /// Seals the memtable however small and waits for its flush.
+    fn flush(e: &Engine) -> io::Result<()> {
+        e.seal(0)?;
+        e.wait_for_flush()
+    }
+
     #[test]
-    fn crash_between_rename_and_wal_reset_replays_harmlessly() {
+    fn crash_between_rename_and_wal_delete_replays_harmlessly() {
         let dir = tempfile::tempdir().unwrap();
-        let wal_path = dir.path().join("wal.log");
         let e = Engine::open(dir.path(), Options::default()).unwrap();
         e.put(b"gone", b"x").unwrap();
-        e.flush(&mut e.state.write().unwrap()).unwrap(); // an older table holds "gone"
+        flush(&e).unwrap(); // an older table holds "gone"; later writes go to WAL 2
         e.put(b"k", b"old").unwrap();
         e.put(b"k", b"new").unwrap();
         e.delete(b"gone").unwrap();
-        let wal_before = fs::read(&wal_path).unwrap();
-        e.flush(&mut e.state.write().unwrap()).unwrap();
-        assert_eq!(fs::metadata(&wal_path).unwrap().len(), 0);
+        let wal = wal_path(dir.path(), 2);
+        let wal_before = fs::read(&wal).unwrap();
+        flush(&e).unwrap();
+        assert!(!wal.exists());
         drop(e);
 
-        fs::write(&wal_path, wal_before).unwrap(); // as if the process died just before the WAL reset
+        fs::write(&wal, wal_before).unwrap(); // as if the process died just before the WAL delete
         let e = Engine::open(dir.path(), Options::default()).unwrap();
         assert_eq!(e.get(b"k").unwrap(), Some(b"new".to_vec()));
         assert_eq!(e.get(b"gone").unwrap(), None);
@@ -659,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_flush_keeps_the_write_and_retries_on_the_next_one() {
+    fn failed_flush_keeps_the_write_and_retries_when_the_memtable_fills_again() {
         let dir = tempfile::tempdir().unwrap();
         let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 10, ..Options::default() }).unwrap();
         // A directory where the flush wants its temp file, so creating that file fails.
@@ -667,15 +797,17 @@ mod tests {
         fs::create_dir(&blocker).unwrap();
         e.put(b"a", b"1").unwrap();
         e.put(b"k", b"0123456789").unwrap(); // over the limit: this write's flush fails
+        assert!(e.wait_for_flush().is_err());
         assert_eq!(e.get(b"k").unwrap(), Some(b"0123456789".to_vec()));
         assert_eq!(sst_count(dir.path()), 0);
 
         fs::remove_dir(&blocker).unwrap();
-        e.put(b"b", b"2").unwrap(); // the retry succeeds
+        e.put(b"b", b"0123456789").unwrap(); // over the limit again: retries that flush, which succeeds
+        e.wait_for_flush().unwrap();
         assert_eq!(sst_count(dir.path()), 1);
-        assert!(e.state.read().unwrap().memtable.is_empty());
+        assert!(e.state.read().unwrap().immutable.is_none());
         let check = |e: &Engine| {
-            for (k, v) in [("a", "1"), ("k", "0123456789"), ("b", "2")] {
+            for (k, v) in [("a", "1"), ("k", "0123456789"), ("b", "0123456789")] {
                 assert_eq!(e.get(k.as_bytes()).unwrap(), Some(v.as_bytes().to_vec()), "{k}");
             }
         };
@@ -684,20 +816,122 @@ mod tests {
         check(&Engine::open(dir.path(), Options::default()).unwrap());
     }
 
+    #[test]
+    fn writes_complete_while_a_flush_is_stuck() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = || Options { memtable_limit_bytes: 10, ..Options::default() };
+        let e = Engine::open(dir.path(), options()).unwrap();
+        let gate = e.flush_gate.lock().unwrap();
+        e.put(b"a", b"0123456789").unwrap(); // over the limit: sealed, and its flush is stuck at the gate
+        e.put(b"b", b"1").unwrap();
+        assert_eq!(e.get(b"a").unwrap(), Some(b"0123456789".to_vec()));
+        assert_eq!(e.get(b"b").unwrap(), Some(b"1".to_vec()));
+        thread::scope(|s| {
+            // Would seal a second memtable, so it waits for the stuck flush, without blocking reads.
+            let second = s.spawn(|| e.put(b"c", b"0123456789").unwrap());
+            thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!second.is_finished(), "a second memtable was sealed while the first was still flushing");
+            assert_eq!(e.get(b"a").unwrap(), Some(b"0123456789".to_vec()));
+            drop(gate);
+        });
+        e.wait_for_flush().unwrap();
+        assert_eq!(sst_count(dir.path()), 2); // {a}, then {b, c}
+        let check = |e: &Engine| {
+            for (k, v) in [("a", "0123456789"), ("b", "1"), ("c", "0123456789")] {
+                assert_eq!(e.get(k.as_bytes()).unwrap(), Some(v.as_bytes().to_vec()), "{k}");
+            }
+        };
+        check(&e);
+        drop(e);
+        check(&Engine::open(dir.path(), options()).unwrap());
+    }
+
+    #[test]
+    fn close_waits_for_a_running_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 10, ..Options::default() }).unwrap();
+        let gate = Arc::clone(&e.flush_gate);
+        let held = gate.lock().unwrap();
+        e.put(b"a", b"0123456789").unwrap(); // over the limit: sealed, and its flush is stuck at the gate
+        thread::scope(|s| {
+            let closing = s.spawn(move || drop(e));
+            thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!closing.is_finished(), "the engine closed while its flush was still running");
+            drop(held);
+        });
+        assert_eq!(sst_count(dir.path()), 1);
+    }
+
+    #[test]
+    fn keys_written_or_deleted_during_a_flush_stay_that_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = || Options { memtable_limit_bytes: 10, ..Options::default() };
+        let e = Engine::open(dir.path(), options()).unwrap();
+        let gate = e.flush_gate.lock().unwrap();
+        e.put(b"a", b"old").unwrap();
+        e.put(b"k", b"0123456789").unwrap(); // over the limit: {a, k} is sealed, and its flush is stuck at the gate
+        e.put(b"a", b"new").unwrap();
+        e.delete(b"k").unwrap();
+        e.put(b"n", b"1").unwrap();
+        let check = |e: &Engine| {
+            for (k, v) in [("a", Some("new")), ("k", None), ("n", Some("1"))] {
+                assert_eq!(e.get(k.as_bytes()).unwrap(), v.map(|v| v.as_bytes().to_vec()), "{k}");
+            }
+            assert_eq!(scan(e, "", 10), ("a=new n=1".into(), false));
+        };
+        check(&e);
+        drop(gate);
+        e.wait_for_flush().unwrap();
+        assert_eq!(sst_count(dir.path()), 1);
+        check(&e);
+        drop(e);
+        check(&Engine::open(dir.path(), options()).unwrap()); // the newer writes are only in WAL 2, over table 1
+    }
+
+    #[test]
+    fn open_replays_every_wal_left_behind_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let put = |k: &[u8], v: &[u8]| Record::Put { key: k.to_vec(), value: v.to_vec() };
+        // Two numbered WALs, as a crash mid-flush leaves them, and the single WAL of an engine from before WALs were numbered.
+        let logs = [
+            (dir.path().join("wal.log"), vec![put(b"k", b"v0"), put(b"a", b"1")]),
+            (wal_path(dir.path(), 9), vec![put(b"k", b"old"), put(b"gone", b"x")]),
+            (wal_path(dir.path(), 10), vec![put(b"k", b"new"), Record::Delete { key: b"gone".to_vec() }]),
+        ];
+        for (path, records) in &logs {
+            let (mut wal, _) = Wal::open(path).unwrap();
+            records.iter().for_each(|record| wal.append(record).unwrap());
+        }
+        let check = |e: &Engine| {
+            for (k, v) in [("k", Some("new")), ("a", Some("1")), ("gone", None)] {
+                assert_eq!(e.get(k.as_bytes()).unwrap(), v.map(|v| v.as_bytes().to_vec()), "{k}");
+            }
+        };
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        check(&e);
+        // One flush holds all three, so it deletes all three.
+        flush(&e).unwrap();
+        let mut files: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        files.sort();
+        assert_eq!(files, ["000001.sst", "000011.wal"]);
+        check(&e);
+        drop(e);
+        check(&Engine::open(dir.path(), Options::default()).unwrap());
+    }
+
     /// Flushes three tables, oldest first: {a: a1, b: b1, gone: x}, {a: a2, c: c2, gone: tombstone}, {b: b3}.
     fn three_tables(dir: &Path) -> Engine {
         let e = Engine::open(dir, Options::default()).unwrap();
-        let flush = |e: &Engine| e.flush(&mut e.state.write().unwrap()).unwrap();
         e.put(b"a", b"a1").unwrap();
         e.put(b"b", b"b1").unwrap();
         e.put(b"gone", b"x").unwrap();
-        flush(&e);
+        flush(&e).unwrap();
         e.put(b"a", b"a2").unwrap();
         e.put(b"c", b"c2").unwrap();
         e.delete(b"gone").unwrap();
-        flush(&e);
+        flush(&e).unwrap();
         e.put(b"b", b"b3").unwrap();
-        flush(&e);
+        flush(&e).unwrap();
         e
     }
 
@@ -707,8 +941,12 @@ mod tests {
         }
     }
 
+    fn start_compaction(e: &Engine) {
+        Engine::start_compaction(&e.dir, &e.state, &mut e.state.write().unwrap());
+    }
+
     fn compact_now(e: &Engine) -> io::Result<()> {
-        e.start_compaction(&mut e.state.write().unwrap());
+        start_compaction(e);
         e.wait_for_compaction()
     }
 
@@ -738,7 +976,8 @@ mod tests {
             assert_eq!(e.get(b"d").unwrap(), Some(b"4".to_vec()));
         })
         .unwrap();
-        // "d", then the merge of tables 1-3 at the seq reserved before "d" flushed.
+        e.wait_for_flush().unwrap();
+        // "d", then the merge of tables 1-3 at the seq reserved before "d" was sealed.
         let seqs: Vec<_> = e.state.read().unwrap().sstables.iter().map(|&(seq, _)| seq).collect();
         assert_eq!(seqs, [5, 4]);
         assert_eq!(sst_count(dir.path()), 2);
@@ -757,9 +996,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let e = three_tables(dir.path());
         while_compaction_stuck(&e, || {
-            e.start_compaction(&mut e.state.write().unwrap());
+            start_compaction(&e);
             e.delete(b"a").unwrap();
-            e.flush(&mut e.state.write().unwrap()).unwrap(); // the tombstone lands in table 5, in front of the merged table 4
+            flush(&e).unwrap(); // the tombstone lands in table 5, in front of the merged table 4
         })
         .unwrap();
         let check = |e: &Engine| {
@@ -834,8 +1073,10 @@ mod tests {
         let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 0, max_sstables: 2, ..Options::default() }).unwrap();
         e.put(b"a", b"1").unwrap();
         e.put(b"b", b"2").unwrap();
+        e.wait_for_flush().unwrap();
         assert_eq!(sst_count(dir.path()), 2);
         e.delete(b"a").unwrap(); // a third table
+        e.wait_for_flush().unwrap(); // the flush starts the compaction
         e.wait_for_compaction().unwrap();
         assert_eq!(sst_count(dir.path()), 1);
         assert_eq!(e.get(b"a").unwrap(), None);
