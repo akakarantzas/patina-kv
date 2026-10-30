@@ -60,7 +60,7 @@ pub struct SsTable {
     // shortcut: full key index in memory; switch to a sparse index if key counts grow.
     index: BTreeMap<Vec<u8>, Slot>,
     // shortcut: reads of one file are serialized by the mutex; switch to positional reads (read_at / seek_read) if gets on one table contend.
-    file: Mutex<File>,
+    pub(crate) file: Mutex<File>,
     compacted_through: u64,
 }
 

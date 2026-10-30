@@ -1,5 +1,6 @@
 //! Kill-the-process test (PLAN.md phases 1 and 2): no acknowledged write is lost when the process dies,
-//! including mid-flush and mid-compaction: the tiny limits make the child flush every few writes and compact every other flush.
+//! including mid-flush and mid-compaction: the tiny limits make the child flush every few writes and start a compaction
+//! whenever a flush leaves more than 2 tables and none is running.
 // A process kill doesn't test power loss; the torn-write test in wal.rs and fsync-before-ack cover that.
 
 use std::io::{BufRead, BufReader, Write};

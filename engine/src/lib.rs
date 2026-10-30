@@ -8,7 +8,8 @@ use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
+use std::thread::{self, JoinHandle};
 
 use sstable::SsTable;
 use wal::{Record, Wal};
@@ -16,14 +17,15 @@ use wal::{Record, Wal};
 pub struct Engine {
     dir: PathBuf,
     options: Options,
-    state: RwLock<State>,
+    /// Shared with the compaction thread.
+    state: Arc<RwLock<State>>,
 }
 
 /// Engine settings; the C ABI sets only `sync_writes` and keeps the other defaults.
 pub struct Options {
     /// A write that takes the bytes written since the last flush past this flushes the memtable to an SSTable.
     pub memtable_limit_bytes: usize,
-    /// A flush that leaves more SSTables than this merges them all into one.
+    /// A flush that leaves more SSTables than this starts merging them all into one on a background thread.
     pub max_sstables: usize,
     /// Sync the WAL before a write returns (the default). Off, the guarantee drops to process-crash safety:
     /// an acked write has reached the OS but not the disk, so power loss or an OS crash can lose it.
@@ -49,9 +51,11 @@ struct State {
     /// Key and value bytes written since the last flush. Overwrites count again, so this also bounds the WAL size.
     memtable_bytes: usize,
     wal: Wal,
-    /// (seq, table), newest seq first.
-    sstables: Vec<(u64, SsTable)>,
+    /// (seq, table), newest seq first. Tables are immutable, so a compaction reads its inputs outside the lock.
+    sstables: Vec<(u64, Arc<SsTable>)>,
     next_seq: u64,
+    /// The running or last compaction; at most one runs at a time.
+    compaction: Option<JoinHandle<io::Result<()>>>,
 }
 
 /// Applies `record` to the memtable and returns the key and value bytes it wrote.
@@ -69,8 +73,9 @@ fn sst_path(dir: &Path, seq: u64) -> PathBuf {
     dir.join(format!("{seq:06}.sst"))
 }
 
-/// Closes `tables`, then deletes their files: Windows can't fully delete a file that is still open.
-fn remove_tables(dir: &Path, tables: Vec<(u64, SsTable)>) -> io::Result<()> {
+/// Closes `tables`, then deletes their files: Windows can't fully delete a file that is still open,
+/// so the caller must hold no other handle to them.
+fn remove_tables(dir: &Path, tables: Vec<(u64, Arc<SsTable>)>) -> io::Result<()> {
     let seqs: Vec<u64> = tables.iter().map(|&(seq, _)| seq).collect();
     drop(tables);
     seqs.into_iter().try_for_each(|seq| fs::remove_file(sst_path(dir, seq)))
@@ -78,10 +83,10 @@ fn remove_tables(dir: &Path, tables: Vec<(u64, SsTable)>) -> io::Result<()> {
 
 /// Streams the live entries at or after `start` in key order from `memtable` and then `tables` (newest first),
 /// reading one table value at a time. Per key the newest source wins; a key whose newest entry is a tombstone is skipped.
-// shortcut: finds the smallest key by checking every source, O(sources) per key; use a BinaryHeap if max_sstables grows large.
+// shortcut: finds the smallest key by checking every source, O(sources) per key; use a BinaryHeap if the table count grows large.
 fn merge<'a>(
     memtable: &'a BTreeMap<Vec<u8>, Value>,
-    tables: &'a [(u64, SsTable)],
+    tables: &'a [(u64, Arc<SsTable>)],
     start: &'a [u8],
 ) -> impl Iterator<Item = io::Result<(&'a [u8], Value)>> {
     let memtable_keys: Box<dyn Iterator<Item = &'a [u8]> + 'a> =
@@ -137,7 +142,7 @@ impl Engine {
         }
         let next_seq = tables.keys().next_back().map_or(1, |seq| seq + 1);
         let mut sstables =
-            tables.into_iter().rev().map(|(seq, path)| Ok((seq, SsTable::open(&path)?))).collect::<io::Result<Vec<_>>>()?;
+            tables.into_iter().rev().map(|(seq, path)| Ok((seq, Arc::new(SsTable::open(&path)?)))).collect::<io::Result<Vec<_>>>()?;
         // A crash between a compaction's rename and its deletes leaves inputs behind that may still hold values
         // whose tombstones the merge dropped. Every seq up to the newest compacted_through was an input.
         let through = sstables.iter().map(|(_, table)| table.compacted_through()).max().unwrap_or(0);
@@ -151,8 +156,8 @@ impl Engine {
         for record in records {
             memtable_bytes += apply(&mut memtable, record);
         }
-        let state = State { memtable, memtable_bytes, wal, sstables, next_seq };
-        Ok(Engine { dir: dir.to_path_buf(), options, state: RwLock::new(state) })
+        let state = State { memtable, memtable_bytes, wal, sstables, next_seq, compaction: None };
+        Ok(Engine { dir: dir.to_path_buf(), options, state: Arc::new(RwLock::new(state)) })
     }
 
     /// Returns Ok only once the write is on disk (with `sync_writes` off: once the OS has it); on error the memtable is unchanged.
@@ -174,9 +179,7 @@ impl Engine {
             if let Err(e) = self.flush(&mut state) {
                 eprintln!("patina: flush to an SSTable failed, retrying on the next write: {e}");
             } else if state.sstables.len() > self.options.max_sstables {
-                if let Err(e) = self.compact(&mut state) {
-                    eprintln!("patina: compaction failed: {e}");
-                }
+                self.start_compaction(&mut state);
             }
         }
         Ok(())
@@ -191,7 +194,7 @@ impl Engine {
         // Same Unix-only rule as wal.rs: the rename must be durable before the WAL stops holding the data.
         #[cfg(unix)]
         fs::File::open(&self.dir)?.sync_all()?;
-        let table = SsTable::open(&path)?;
+        let table = Arc::new(SsTable::open(&path)?);
         // A crash before this reset leaves the data in both places: replay rebuilds exactly this table's entries, which shadow it harmlessly.
         state.wal.reset()?;
         state.sstables.insert(0, (state.next_seq, table));
@@ -201,29 +204,58 @@ impl Engine {
         Ok(())
     }
 
-    /// Merges every SSTable into one at the next seq without tombstones, then deletes the inputs.
-    /// Dropping tombstones is safe: every table is an input, so no older value is left for them to hide.
-    // shortcut: rewrites every live entry (one seek + read per value) under the write lock, so reads and writes stall meanwhile; move it to a background thread if stalls matter.
-    fn compact(&self, state: &mut State) -> io::Result<()> {
-        let path = sst_path(&self.dir, state.next_seq);
+    /// Starts merging every SSTable into one on a background thread, unless a compaction is already running.
+    // shortcut: tables flushed during a merge stay unmerged until it ends, so a long merge under steady writes leaves many tables for every get and scan to check; stall writes above a hard cap if reads must stay fast then.
+    fn start_compaction(&self, state: &mut State) {
+        if state.compaction.as_ref().is_some_and(|c| !c.is_finished()) {
+            return;
+        }
+        // Reserved now, so tables flushed during the merge get higher seqs and stay in front of it after a reopen too.
+        let (inputs, seq) = (state.sstables.clone(), state.next_seq);
+        state.next_seq += 1;
+        let (dir, shared) = (self.dir.clone(), Arc::clone(&self.state));
+        let spawned = thread::Builder::new()
+            .spawn(move || Engine::compact(&dir, &shared, inputs, seq).inspect_err(|e| eprintln!("patina: compaction failed: {e}")));
+        state.compaction = spawned.inspect_err(|e| eprintln!("patina: cannot start a compaction thread: {e}")).ok();
+    }
+
+    /// Merges `inputs`, every SSTable when the compaction started, into `<seq>.sst` without tombstones while reads
+    /// and writes go on, then swaps it in behind the tables flushed meanwhile and deletes the inputs.
+    /// Dropping tombstones is safe: every table older than the newest input is an input, so no older value is left for them to hide.
+    fn compact(dir: &Path, state: &RwLock<State>, inputs: Vec<(u64, Arc<SsTable>)>, seq: u64) -> io::Result<()> {
+        let path = sst_path(dir, seq);
         let tmp = path.with_extension("sst.tmp");
-        let through = state.sstables[0].0;
+        let through = inputs[0].0;
         let mut failed = None;
         let no_memtable = BTreeMap::new(); // the memtable is still in the WAL, so it stays out of the merged table
         // A read error ends the merge early; checking `failed` keeps that short file from being renamed into place.
-        let entries = merge(&no_memtable, &state.sstables, b"").map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
-        sstable::write(&tmp, entries, through)?;
-        if let Some(e) = failed {
+        let entries = merge(&no_memtable, &inputs, b"").map_while(|entry| entry.map_err(|e| failed = Some(e)).ok());
+        if let Err(e) = sstable::write(&tmp, entries, through).and_then(|()| failed.map_or(Ok(()), Err)) {
+            let _ = fs::remove_file(&tmp); // a retry takes a new seq, so nothing else would overwrite this file
             return Err(e);
         }
         fs::rename(&tmp, &path)?;
         // Same Unix-only rule as wal.rs: the rename must be durable before the inputs are deleted.
         #[cfg(unix)]
-        fs::File::open(&self.dir)?.sync_all()?;
-        let table = SsTable::open(&path)?;
-        let inputs = std::mem::replace(&mut state.sstables, vec![(state.next_seq, table)]);
-        state.next_seq += 1;
-        remove_tables(&self.dir, inputs)
+        fs::File::open(dir)?.sync_all()?;
+        let table = Arc::new(SsTable::open(&path)?);
+        let old = {
+            let mut state = state.write().unwrap();
+            // Flushes only add tables in front and only this compaction removes any, so the inputs are still the last ones.
+            let keep = state.sstables.len() - inputs.len();
+            let old = state.sstables.split_off(keep);
+            state.sstables.push((seq, table));
+            old
+        };
+        drop(inputs); // remove_tables closes the files only once these handles are gone too
+        remove_tables(dir, old)
+    }
+
+    /// Waits for the running or last compaction and returns its result.
+    fn wait_for_compaction(&self) -> io::Result<()> {
+        // Taken out under the lock and joined outside it: the compaction needs the lock to swap its table in.
+        let compaction = self.state.write().unwrap().compaction.take();
+        compaction.map_or(Ok(()), |c| c.join().unwrap_or_else(|_| Err(io::Error::other("compaction thread panicked"))))
     }
 
     /// Looks in the memtable, then the SSTables newest first. The first entry found wins, so a tombstone hides older values.
@@ -255,6 +287,13 @@ impl Engine {
             items.push((key.to_vec(), value));
         }
         Ok((items, false))
+    }
+}
+
+impl Drop for Engine {
+    // The compaction thread must not outlive the engine, nor the library holding its code once Java unloads it.
+    fn drop(&mut self) {
+        let _ = self.wait_for_compaction();
     }
 }
 
@@ -668,11 +707,81 @@ mod tests {
         }
     }
 
+    fn compact_now(e: &Engine) -> io::Result<()> {
+        e.start_compaction(&mut e.state.write().unwrap());
+        e.wait_for_compaction()
+    }
+
+    /// Runs `f` with every current SSTable's file locked, so a compaction started meanwhile is stuck on its first
+    /// value read, checks that it is still running, then lets it finish and returns its result.
+    fn while_compaction_stuck(e: &Engine, f: impl FnOnce()) -> io::Result<()> {
+        let tables: Vec<_> = e.state.read().unwrap().sstables.iter().map(|(_, table)| Arc::clone(table)).collect();
+        let files: Vec<_> = tables.iter().map(|table| table.file.lock().unwrap()).collect();
+        f();
+        assert!(e.state.read().unwrap().compaction.as_ref().is_some_and(|c| !c.is_finished()), "no compaction is running");
+        drop(files);
+        drop(tables);
+        e.wait_for_compaction()
+    }
+
+    #[test]
+    fn writes_complete_while_a_compaction_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        // Limit 0: every write flushes.
+        let options = || Options { memtable_limit_bytes: 0, max_sstables: 2, ..Options::default() };
+        let e = Engine::open(dir.path(), options()).unwrap();
+        e.put(b"a", b"1").unwrap();
+        e.put(b"b", b"2").unwrap();
+        while_compaction_stuck(&e, || {
+            e.put(b"c", b"3").unwrap(); // a third table: starts a compaction, which gets stuck reading "a"
+            e.put(b"d", b"4").unwrap(); // a fourth table, which must start no second compaction
+            assert_eq!(e.get(b"d").unwrap(), Some(b"4".to_vec()));
+        })
+        .unwrap();
+        // "d", then the merge of tables 1-3 at the seq reserved before "d" flushed.
+        let seqs: Vec<_> = e.state.read().unwrap().sstables.iter().map(|&(seq, _)| seq).collect();
+        assert_eq!(seqs, [5, 4]);
+        assert_eq!(sst_count(dir.path()), 2);
+        let check = |e: &Engine| {
+            for (k, v) in [("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")] {
+                assert_eq!(e.get(k.as_bytes()).unwrap(), Some(v.as_bytes().to_vec()), "{k}");
+            }
+        };
+        check(&e);
+        drop(e);
+        check(&Engine::open(dir.path(), options()).unwrap());
+    }
+
+    #[test]
+    fn a_key_deleted_during_a_compaction_stays_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = three_tables(dir.path());
+        while_compaction_stuck(&e, || {
+            e.start_compaction(&mut e.state.write().unwrap());
+            e.delete(b"a").unwrap();
+            e.flush(&mut e.state.write().unwrap()).unwrap(); // the tombstone lands in table 5, in front of the merged table 4
+        })
+        .unwrap();
+        let check = |e: &Engine| {
+            for (k, v) in [("a", None), ("b", Some("b3")), ("c", Some("c2")), ("gone", None)] {
+                assert_eq!(e.get(k.as_bytes()).unwrap(), v.map(|v| v.as_bytes().to_vec()), "{k}");
+            }
+        };
+        check(&e);
+        drop(e);
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        check(&e);
+        // The next compaction merges the tombstone with the value it hides and drops both.
+        compact_now(&e).unwrap();
+        check(&e);
+        assert!(e.state.read().unwrap().sstables[0].1.keys(b"").eq([&b"b"[..], b"c"]));
+    }
+
     #[test]
     fn compaction_keeps_newest_values_and_drops_tombstones() {
         let dir = tempfile::tempdir().unwrap();
         let e = three_tables(dir.path());
-        e.compact(&mut e.state.write().unwrap()).unwrap();
+        compact_now(&e).unwrap();
         {
             let state = e.state.read().unwrap();
             let [(seq, table)] = &state.sstables[..] else { panic!("{} tables after compaction", state.sstables.len()) };
@@ -693,7 +802,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let e = three_tables(dir.path());
             let old: Vec<_> = (1..=left_behind).map(|seq| (sst_path(dir.path(), seq), fs::read(sst_path(dir.path(), seq)).unwrap())).collect();
-            e.compact(&mut e.state.write().unwrap()).unwrap();
+            compact_now(&e).unwrap();
             drop(e);
             for (path, bytes) in &old {
                 fs::write(path, bytes).unwrap();
@@ -712,8 +821,9 @@ mod tests {
         let e = three_tables(dir.path());
         // Table 2 holds the newest "a" and "c", so the merge has to read values from it.
         fs::OpenOptions::new().write(true).open(sst_path(dir.path(), 2)).unwrap().set_len(0).unwrap();
-        assert!(e.compact(&mut e.state.write().unwrap()).is_err());
+        assert!(compact_now(&e).is_err());
         assert!(!sst_path(dir.path(), 4).exists());
+        assert!(!sst_path(dir.path(), 4).with_extension("sst.tmp").exists());
         assert_eq!(sst_count(dir.path()), 3);
     }
 
@@ -726,6 +836,7 @@ mod tests {
         e.put(b"b", b"2").unwrap();
         assert_eq!(sst_count(dir.path()), 2);
         e.delete(b"a").unwrap(); // a third table
+        e.wait_for_compaction().unwrap();
         assert_eq!(sst_count(dir.path()), 1);
         assert_eq!(e.get(b"a").unwrap(), None);
         assert_eq!(e.get(b"b").unwrap(), Some(b"2".to_vec()));
