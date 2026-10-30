@@ -40,6 +40,17 @@ class PatinaEngineTest {
     }
 
     @Test
+    void unsyncedWritesSurviveReopen() {
+        try (PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir, false)) {
+            engine.put("user#1".getBytes(UTF_8), "alice".getBytes(UTF_8));
+        }
+        try (PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir)) {
+            assertThat(engine.get("user#1".getBytes(UTF_8))).hasValueSatisfying(v ->
+                    assertThat(new String(v, UTF_8)).isEqualTo("alice"));
+        }
+    }
+
+    @Test
     void deleteCrossesIntoRustAndSurvivesReopen() {
         byte[] k = "user#1".getBytes(UTF_8);
         try (PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir)) {

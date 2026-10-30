@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'org.springframework.boot' version '3.5.7'
     id 'io.spring.dependency-management' version '1.1.7'
+    id 'me.champeau.jmh' version '0.7.4'
 }
 
 group = 'dev.patina'
@@ -21,6 +22,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-web'
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    jmh 'org.rocksdb:rocksdbjni:11.8.1' // benchmarks only: the service never uses RocksDB
 }
 
 // Build the Rust engine first so the native library is always current.
@@ -40,4 +42,16 @@ tasks.withType(Test).configureEach {
 tasks.named('bootRun') {
     dependsOn cargoBuild
     jvmArgs '--enable-native-access=ALL-UNNAMED'
+}
+
+// ./gradlew jmh: Patina vs RocksDB (src/jmh), results in build/results/jmh/results.txt.
+def nativeLibrary = file("../engine/target/release/${System.mapLibraryName('patina_engine')}")
+jmh {
+    jmhVersion = '1.37'
+    jvmArgsAppend = ['--enable-native-access=ALL-UNNAMED', "-Dpatina.library=${nativeLibrary}".toString()]
+}
+
+tasks.named('jmh') {
+    dependsOn cargoBuild
+    inputs.file(nativeLibrary)
 }

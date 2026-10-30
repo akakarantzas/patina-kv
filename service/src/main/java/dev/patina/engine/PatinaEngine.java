@@ -1,6 +1,7 @@
 package dev.patina.engine;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BOOLEAN;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
 import static java.lang.foreign.ValueLayout.JAVA_INT;
 import static java.lang.foreign.ValueLayout.JAVA_LONG;
@@ -43,8 +44,16 @@ public final class PatinaEngine implements AutoCloseable {
     private boolean closed;
 
     public PatinaEngine(Path library, Path dataDir) {
+        this(library, dataDir, true);
+    }
+
+    /**
+     * syncWrites = true makes every acked put/delete survive power loss (the WAL is synced first).
+     * false skips that sync: acked writes then survive a process crash, but power loss or an OS crash can lose them.
+     */
+    public PatinaEngine(Path library, Path dataDir, boolean syncWrites) {
         SymbolLookup lib = SymbolLookup.libraryLookup(library, libraryArena);
-        MethodHandle open = bind(lib, "patina_open", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG));
+        MethodHandle open = bind(lib, "patina_open", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_LONG, JAVA_BOOLEAN));
         close = bind(lib, "patina_close", FunctionDescriptor.ofVoid(ADDRESS));
         put = bind(lib, "patina_put", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, JAVA_LONG));
         get = bind(lib, "patina_get", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG, ADDRESS, ADDRESS));
@@ -53,7 +62,7 @@ public final class PatinaEngine implements AutoCloseable {
         free = bind(lib, "patina_free", FunctionDescriptor.ofVoid(ADDRESS, JAVA_LONG));
         byte[] path = dataDir.toString().getBytes(UTF_8);
         try (Arena call = Arena.ofConfined()) {
-            handle = (MemorySegment) open.invokeExact(call.allocateFrom(JAVA_BYTE, path), (long) path.length);
+            handle = (MemorySegment) open.invokeExact(call.allocateFrom(JAVA_BYTE, path), (long) path.length, syncWrites);
         } catch (Throwable t) {
             throw rethrow(t);
         }

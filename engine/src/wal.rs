@@ -21,6 +21,9 @@ pub enum Record {
 pub struct Wal {
     file: File,
     failed: bool,
+    /// Whether `append` syncs before returning (the default). Off, an acked record has only reached the OS:
+    /// it survives a process crash but not power loss or an OS crash.
+    pub sync: bool,
 }
 
 impl Wal {
@@ -50,10 +53,10 @@ impl Wal {
             file.sync_all()?;
         }
         file.seek(SeekFrom::Start(end as u64))?;
-        Ok((Wal { file, failed: false }, records))
+        Ok((Wal { file, failed: false, sync: true }, records))
     }
 
-    /// Returns Ok only once the record is on disk.
+    /// Returns Ok only once the record is on disk, or with `sync` off, once the OS has it.
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
         // A failed write can leave a partial record, and recovery stops there: anything appended after it would be lost.
         if self.failed {
@@ -81,7 +84,7 @@ impl Wal {
         buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
         buf[4..HEADER].copy_from_slice(&crc.to_le_bytes());
 
-        let result = self.file.write_all(&buf).and_then(|()| self.file.sync_data());
+        let result = self.file.write_all(&buf).and_then(|()| if self.sync { self.file.sync_data() } else { Ok(()) });
         self.failed = result.is_err();
         result
     }

@@ -14,8 +14,8 @@ use patina_engine::{Engine, Options};
 /// Caps the child, so one orphaned by a dead parent can't fill the disk.
 const WRITES: u32 = 100_000;
 
-fn tiny() -> Options {
-    Options { memtable_limit_bytes: 100, max_sstables: 2 }
+fn tiny(sync_writes: bool) -> Options {
+    Options { memtable_limit_bytes: 100, max_sstables: 2, sync_writes }
 }
 
 fn key(i: u32) -> [u8; 4] {
@@ -36,7 +36,8 @@ fn is_deleted(i: u32) -> bool {
 #[ignore]
 fn child_writer() {
     let Some(dir) = std::env::var_os("PATINA_CRASH_DIR") else { return };
-    let engine = Engine::open(Path::new(&dir), tiny()).unwrap();
+    let sync_writes = std::env::var("PATINA_CRASH_SYNC").as_deref() != Ok("0");
+    let engine = Engine::open(Path::new(&dir), tiny(sync_writes)).unwrap();
     for i in 0..WRITES {
         engine.put(&key(i), &value(i)).unwrap();
         if is_deleted(i) {
@@ -51,11 +52,13 @@ fn child_writer() {
 fn no_acked_write_lost_on_kill() {
     let mut iterations_compacted = 0;
     let mut iterations_mid_flush = 0;
-    for iteration in 0..100 {
+    // 100 iterations with sync_writes on, then 20 with it off: unsynced acks must survive a process kill too.
+    for iteration in 0..120 {
         let tmp = tempfile::tempdir().unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_writer", "--ignored", "--nocapture"])
             .env("PATINA_CRASH_DIR", tmp.path())
+            .env("PATINA_CRASH_SYNC", if iteration < 100 { "1" } else { "0" })
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
@@ -102,7 +105,7 @@ fn no_acked_write_lost_on_kill() {
         iterations_mid_flush += usize::from(mid_flush);
 
         // The child writes only keys 0..WRITES, so probing that range finds any key it could have left behind.
-        let engine = Engine::open(tmp.path(), tiny()).unwrap();
+        let engine = Engine::open(tmp.path(), tiny(true)).unwrap();
         let bad = (0..WRITES).find(|&i| {
             let got = engine.get(&key(i)).unwrap();
             if i > last_ack + 1 {

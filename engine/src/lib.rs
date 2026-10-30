@@ -19,17 +19,20 @@ pub struct Engine {
     state: RwLock<State>,
 }
 
-/// Engine settings; the C ABI always uses the defaults.
+/// Engine settings; the C ABI sets only `sync_writes` and keeps the other defaults.
 pub struct Options {
     /// A write that takes the bytes written since the last flush past this flushes the memtable to an SSTable.
     pub memtable_limit_bytes: usize,
     /// A flush that leaves more SSTables than this merges them all into one.
     pub max_sstables: usize,
+    /// Sync the WAL before a write returns (the default). Off, the guarantee drops to process-crash safety:
+    /// an acked write has reached the OS but not the disk, so power loss or an OS crash can lose it.
+    pub sync_writes: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { memtable_limit_bytes: 4 * 1024 * 1024, max_sstables: 4 }
+        Options { memtable_limit_bytes: 4 * 1024 * 1024, max_sstables: 4, sync_writes: true }
     }
 }
 
@@ -141,7 +144,8 @@ impl Engine {
         let merged = sstables.split_off(sstables.partition_point(|&(seq, _)| seq > through));
         remove_tables(dir, merged)?;
 
-        let (wal, records) = Wal::open(&dir.join("wal.log"))?;
+        let (mut wal, records) = Wal::open(&dir.join("wal.log"))?;
+        wal.sync = options.sync_writes;
         let mut memtable = BTreeMap::new();
         let mut memtable_bytes = 0;
         for record in records {
@@ -151,7 +155,7 @@ impl Engine {
         Ok(Engine { dir: dir.to_path_buf(), options, state: RwLock::new(state) })
     }
 
-    /// Returns Ok only once the write is on disk; on error the memtable is unchanged.
+    /// Returns Ok only once the write is on disk (with `sync_writes` off: once the OS has it); on error the memtable is unchanged.
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         self.write(Record::Put { key: key.to_vec(), value: value.to_vec() })
     }
@@ -265,12 +269,13 @@ unsafe fn bytes<'a>(p: *const u8, len: usize) -> &'a [u8] {
     if len == 0 { &[] } else { unsafe { std::slice::from_raw_parts(p, len) } }
 }
 
-/// `path` is a UTF-8 data directory path. Returns null on failure, with the reason on stderr. Release with `patina_close`.
+/// `path` is a UTF-8 data directory path; `sync_writes` is `Options::sync_writes`.
+/// Returns null on failure, with the reason on stderr. Release with `patina_close`.
 ///
 /// # Safety
 /// `path` must point to `path_len` readable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn patina_open(path: *const u8, path_len: usize) -> *mut Engine {
+pub unsafe extern "C" fn patina_open(path: *const u8, path_len: usize, sync_writes: bool) -> *mut Engine {
     catch_unwind(AssertUnwindSafe(|| {
         let dir = match std::str::from_utf8(unsafe { bytes(path, path_len) }) {
             Ok(dir) => dir,
@@ -279,7 +284,7 @@ pub unsafe extern "C" fn patina_open(path: *const u8, path_len: usize) -> *mut E
                 return ptr::null_mut();
             }
         };
-        match Engine::open(Path::new(dir), Options::default()) {
+        match Engine::open(Path::new(dir), Options { sync_writes, ..Options::default() }) {
             Ok(engine) => Box::into_raw(Box::new(engine)),
             Err(e) => {
                 eprintln!("patina_open: cannot open data dir {dir}: {e}");
@@ -444,7 +449,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
         unsafe {
-            let e = patina_open(path.as_ptr(), path.len());
+            let e = patina_open(path.as_ptr(), path.len(), true);
             assert!(!e.is_null());
             let (k, v) = (b"user#1", b"alice");
             assert_eq!(patina_put(e, k.as_ptr(), k.len(), v.as_ptr(), v.len()), OK);
@@ -469,7 +474,7 @@ mod tests {
 
     #[test]
     fn open_rejects_non_utf8_path() {
-        assert!(unsafe { patina_open([0xFF].as_ptr(), 1) }.is_null());
+        assert!(unsafe { patina_open([0xFF].as_ptr(), 1, true) }.is_null());
     }
 
     #[test]
@@ -553,7 +558,7 @@ mod tests {
     #[test]
     fn reads_span_many_sstables_and_survive_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let tiny = || Options { memtable_limit_bytes: 64, max_sstables: usize::MAX }; // never compacts, so reads must span tables
+        let tiny = || Options { memtable_limit_bytes: 64, max_sstables: usize::MAX, ..Options::default() }; // never compacts, so reads must span tables
         let key = |i: u32| i.to_be_bytes();
         let e = Engine::open(dir.path(), tiny()).unwrap();
         for i in 0..100 {
@@ -716,7 +721,7 @@ mod tests {
     fn a_flush_past_max_sstables_compacts() {
         let dir = tempfile::tempdir().unwrap();
         // Limit 0: every write flushes.
-        let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 0, max_sstables: 2 }).unwrap();
+        let e = Engine::open(dir.path(), Options { memtable_limit_bytes: 0, max_sstables: 2, ..Options::default() }).unwrap();
         e.put(b"a", b"1").unwrap();
         e.put(b"b", b"2").unwrap();
         assert_eq!(sst_count(dir.path()), 2);
@@ -836,7 +841,7 @@ mod tests {
         sstable::write(&sst_path(dir.path(), 1), entries, 0).unwrap();
         let path = dir.path().to_str().unwrap();
         unsafe {
-            let e = patina_open(path.as_ptr(), path.len());
+            let e = patina_open(path.as_ptr(), path.len(), true);
             assert!(!e.is_null());
             let (k, v) = (b"k0001", b"new");
             assert_eq!(patina_put(e, k.as_ptr(), k.len(), v.as_ptr(), v.len()), OK);
