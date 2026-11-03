@@ -373,7 +373,8 @@ impl Engine {
         remove_tables(dir, old)
     }
 
-    /// Waits for the running or last compaction and returns its result.
+    /// Waits for the running or last compaction and returns its result. Call it only once no flush can start (after
+    /// `wait_for_flush`, with no writes running): a flush that ends after the handle is taken out starts a second compaction.
     fn wait_for_compaction(&self) -> io::Result<()> {
         // Taken out under the lock and joined outside it: the compaction needs the lock to swap its table in.
         let compaction = self.state.write().unwrap().compaction.take();
