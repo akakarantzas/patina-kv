@@ -73,6 +73,9 @@ public class PatinaVsRocksDb {
 
         @Setup(Level.Trial)
         public void open() throws Exception {
+            // The SSD keeps absorbing a heavy trial's writes for tens of seconds, and fsyncs wait on it: in JMH's order
+            // RocksDB's synced trials always follow Patina's 4 KiB unsynced one, so without this pause they lose 2-3x.
+            if (sync) Thread.sleep(120_000);
             dir = Files.createTempDirectory("patina-bench");
             store = Store.open(engine, dir, sync);
             value = randomBytes(valueSize);
