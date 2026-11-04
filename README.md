@@ -75,7 +75,7 @@ An SSTable is sorted entries plus a footer (entry count, `compacted_through`, cr
 
 ## Results
 
-AMD Ryzen 7 5700U, 15.3 GiB RAM, Samsung MZVLB512HBJQ NVMe SSD, Windows 11 Home (plugged in), Temurin 25.0.5, rustc 1.99.1, rocksdbjni 11.8.1, JMH 1.37. Every row except the concurrent one comes from one run on commit `fce7797`; that one comes from a later run. One thread (8 in the concurrent row), one fork per row: `±` is the 99.9% interval over that row's 5 iterations, and separate runs have differed by up to about 20%. Numbers are rounded to two significant digits of their `±`; the exact values, the full conditions and two before/after comparisons are in [docs/benchmarks.md](docs/benchmarks.md). To reproduce: `cd service && ./gradlew jmh` (about 31 minutes; output in `service/build/results/jmh/results.txt`).
+AMD Ryzen 7 5700U, 15.3 GiB RAM, Samsung MZVLB512HBJQ NVMe SSD, Windows 11 Home (plugged in), Temurin 25.0.5, rustc 1.99.1, rocksdbjni 11.8.1, JMH 1.37. Every row except the concurrent one comes from one run on commit `fce7797`; that one comes from a later run on `ec8af7b`. One thread (8 in the concurrent row), one fork per row: `±` is the 99.9% interval over that row's 5 iterations, and separate runs have differed by up to about 20%. Numbers are rounded to two significant digits of their `±`; the exact values, the full conditions and two before/after comparisons are in [docs/benchmarks.md](docs/benchmarks.md). To reproduce: `cd service && ./gradlew jmh` (about 31 minutes; output in `service/build/results/jmh/results.txt`).
 
 ### Patina vs RocksDB
 
@@ -102,7 +102,7 @@ Moving compaction to a background thread made unsynced writes 3.1–6.4× faster
 
 ### Concurrent synced writes
 
-8 threads put random keys with 100 B values into one store, sync on, with the same settings, warmup, measurement and 2-minute pause as above. This is a later run, on the group-commit change; its single-threaded rows landed within error of the table above ([details](docs/benchmarks.md#group-commit)).
+8 threads put random keys with 100 B values into one store, sync on, with the same settings, warmup, measurement and 2-minute pause as above. This is a later run, on commit `ec8af7b`; its single-threaded rows landed within error of the table above ([details](docs/benchmarks.md#group-commit)).
 
 ops/s across all 8 threads, higher is better:
 

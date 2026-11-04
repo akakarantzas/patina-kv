@@ -14,7 +14,7 @@ Every engine setting is listed in the README and, one by one, in the header comm
 
 ## Exact results
 
-[results-fce7797.txt](results-fce7797.txt) is JMH's own output for the run, unrounded: every Patina vs RocksDB row except the concurrent one, and the FFM table.
+[results-fce7797.txt](results-fce7797.txt) is JMH's own output for the run, unrounded: every Patina vs RocksDB row except the concurrent one, and the FFM table. [results-ec8af7b.txt](results-ec8af7b.txt) is the same for the [group-commit](#group-commit) run, the concurrent row included.
 
 ## Why synced trials pause for 2 minutes
 
@@ -31,7 +31,7 @@ With the pause, every synced iteration in the run, warmups included, landed betw
 
 ## Group commit
 
-Measured on the group-commit change (the commit after `d226628`) in one full `./gradlew jmh` run on 2026-11-04 from 02:14 to 02:45, on the same machine, plugged in, with the OneDrive client not running when the run started. Windows' power log has no sleep or standby events in that window. The run adds `syncedPut8Threads`, named so it sorts last and the other trials keep their order.
+Measured on commit `ec8af7b` in one full `./gradlew jmh` run on 2026-11-04 from 02:14 to 02:45, on the same machine, plugged in, with the OneDrive client not running when the run started. Windows' power log has no sleep or standby events in that window. The run adds `syncedPut8Threads`, named so it sorts last and the other trials keep their order. It ran before that commit's last edits, which touched only tests, comments and docs, and made `Wal::append` test-only and `Wal::failed` visible to the engine's tests.
 
 | syncedPut8Threads, 100 B, ops/s | Score | Iterations, warmups included |
 |---|---:|---|
