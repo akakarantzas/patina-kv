@@ -29,7 +29,7 @@ fn value(i: u32) -> Vec<u8> {
 
 /// Every 5th key is put and then deleted before its ack.
 fn is_deleted(i: u32) -> bool {
-    i % 5 == 0
+    i.is_multiple_of(5)
 }
 
 /// The writer process the test below spawns and kills; a no-op unless PATINA_CRASH_DIR is set.
