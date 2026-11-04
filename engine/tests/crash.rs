@@ -91,6 +91,11 @@ fn no_acked_write_lost_on_kill() {
         // Then a random delay, or the kill always lands at the start of the next write, before any flush begins.
         std::thread::sleep(Duration::from_millis((nanos / 61 % 51).into()));
         assert!(child.try_wait().unwrap().is_none(), "iteration {iteration}: child exited before the kill");
+        assert_eq!(
+            Engine::open(tmp.path(), tiny(true)).err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::WouldBlock),
+            "iteration {iteration}: opened the dir the child has open"
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         reader.join().unwrap();

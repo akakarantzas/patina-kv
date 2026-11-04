@@ -73,6 +73,14 @@ class PatinaEngineTest {
     }
 
     @Test
+    void secondEngineOnAnOpenDataDirFailsToOpen() {
+        try (PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir)) {
+            assertThatIllegalStateException().isThrownBy(() -> new PatinaEngine(LIBRARY, dataDir))
+                    .withMessageContaining(dataDir.toString());
+        }
+    }
+
+    @Test
     void callsAfterCloseThrowInsteadOfCrashingTheJvm() {
         PatinaEngine engine = new PatinaEngine(LIBRARY, dataDir);
         engine.close();

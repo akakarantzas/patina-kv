@@ -26,6 +26,8 @@ pub struct Engine {
     commit: Mutex<Commit>,
     /// Signalled when a batch's sync ends.
     committed: Condvar,
+    /// `dir/LOCK`, exclusively locked for the engine's lifetime so a second open of `dir` fails; the OS frees it if the process dies.
+    _lock: fs::File,
     /// Tests hold this to stop a flush before it writes anything.
     #[cfg(test)]
     flush_gate: Arc<Mutex<()>>,
@@ -168,7 +170,7 @@ fn merge<'a>(
 impl Engine {
     /// Creates `dir` if needed, deletes leftover `*.tmp` files, opens its `<seq>.sst` files, deletes the ones
     /// a compaction already merged, and replays every `<n>.wal` into the memtable, oldest first.
-    /// shortcut: no lock file, so two processes opening the same dir corrupt each other's WAL; add one before running more than one instance.
+    /// Fails with `WouldBlock` if another engine, in this process or another, has `dir` open.
     pub fn open(dir: &Path, options: Options) -> io::Result<Engine> {
         fs::create_dir_all(dir)?;
         // Same Unix-only rule as wal.rs: make a newly created dir's own entry durable before any write is acked.
@@ -177,6 +179,13 @@ impl Engine {
             let parent = dir.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
             fs::File::open(parent)?.sync_all()?;
         }
+        let lock = fs::File::options().create(true).truncate(false).write(true).open(dir.join("LOCK"))?;
+        lock.try_lock().map_err(|e| match e {
+            fs::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, format!("data dir {} is already open", dir.display()))
+            }
+            fs::TryLockError::Error(e) => e,
+        })?;
         let (mut tables, mut wals) = (BTreeMap::new(), BTreeMap::new());
         for entry in fs::read_dir(dir)? {
             let path = entry?.path();
@@ -239,6 +248,7 @@ impl Engine {
             sealing: Mutex::new(()),
             commit: Mutex::default(),
             committed: Condvar::new(),
+            _lock: lock,
             #[cfg(test)]
             flush_gate: Arc::default(),
         })
@@ -718,6 +728,18 @@ mod tests {
     }
 
     #[test]
+    fn second_open_of_an_open_dir_fails_until_the_first_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        e.put(b"k", b"v").unwrap();
+        let err = Engine::open(dir.path(), Options::default()).err().expect("second open succeeded");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert!(err.to_string().contains(&dir.path().display().to_string()), "{err}");
+        drop(e);
+        assert_eq!(Engine::open(dir.path(), Options::default()).unwrap().get(b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
     fn delete_hides_key_and_keeps_a_tombstone() {
         let dir = tempfile::tempdir().unwrap();
         let e = Engine::open(dir.path(), Options::default()).unwrap();
@@ -1027,7 +1049,7 @@ mod tests {
         flush(&e).unwrap();
         let mut files: Vec<_> = fs::read_dir(dir.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
         files.sort();
-        assert_eq!(files, ["000001.sst", "000011.wal"]);
+        assert_eq!(files, ["000001.sst", "000011.wal", "LOCK"]);
         check(&e);
         drop(e);
         check(&Engine::open(dir.path(), Options::default()).unwrap());

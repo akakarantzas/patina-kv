@@ -12,7 +12,7 @@ A test kills the writer process 120 times and no acknowledged write is lost. On 
 
 ## Run
 
-Needs Rust 1.85+ and JDK 25. On Windows, also install the Visual Studio C++ Build Tools and run the commands in Git Bash.
+Needs Rust 1.89+ and JDK 25. On Windows, also install the Visual Studio C++ Build Tools and run the commands in Git Bash.
 
 ```bash
 cd service
@@ -47,7 +47,7 @@ payload = [op u8 = 0][key_len u32][key][value_len u32][value]   put
 
 A record goes out in one write and is fsynced before the call returns (unless sync-writes is off). Synced writes that arrive while an fsync is running queue up, and the first of them to wake writes them all at once and fsyncs once (group commit): a test has 8 threads write at once and counts 2 fsyncs. If the write or fsync fails, every call in that batch errors, the memtable is unchanged, and the WAL refuses further appends until reopened, because a partial record would hide everything written after it.
 
-On open, recovery replays every WAL file left, oldest first, each up to its first incomplete or corrupt record, and truncates and syncs a file cut short. Tested by cutting a log at every byte offset.
+Open first takes an exclusive OS lock on `dir/LOCK`, so a second engine on the same dir, in any process, fails to open; the OS releases the lock if the process dies. Then recovery replays every WAL file left, oldest first, each up to its first incomplete or corrupt record, and truncates and syncs a file cut short. Tested by cutting a log at every byte offset.
 
 **Flush** ([lib.rs](engine/src/lib.rs)). When the memtable passes 4 MiB, the write that crossed the limit seals it: under the lock it opens the next WAL file, swaps in a fresh memtable, keeps the full one as the immutable memtable and reserves the next seq for its table. A background thread then writes it out without the lock:
 
@@ -140,7 +140,6 @@ A get crosses the boundary twice (`patina_get`, `patina_free`) and copies the va
 - Compaction always merges every table, so its cost grows with the store, and it needs disk space for a second copy of the data.
 - One memtable at a time waits for its flush, so once flushes fall behind, for example while a full compaction shares the disk, writes run at flush speed.
 - Tables flushed while a merge runs stay unmerged until it ends, so under steady writes the table count, and the lookups per get and scan, can grow well past 4. Nothing stalls writes to cap it.
-- No lock file: two processes on one data dir corrupt each other's WAL.
 - Power-loss safety is argued from fsync-before-ack and the torn-tail test, not tested. On Windows, directory fsyncs are skipped.
 - Recovery assumes the only damage is a torn tail: corruption mid-log silently drops every later record.
 - No bloom filters, block cache, compression or leveled compaction.
