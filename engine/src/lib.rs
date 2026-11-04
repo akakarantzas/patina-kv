@@ -5,10 +5,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::ops::Bound;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::mem;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::thread::{self, JoinHandle};
 
 use sstable::SsTable;
@@ -21,6 +22,10 @@ pub struct Engine {
     state: Arc<RwLock<State>>,
     /// Held by the write that seals the memtable, so one write at a time waits for a running flush or retries a failed one.
     sealing: Mutex<()>,
+    /// Synced writes that arrive while another one syncs wait here for the next batch: see `group_commit`.
+    commit: Mutex<Commit>,
+    /// Signalled when a batch's sync ends.
+    committed: Condvar,
     /// Tests hold this to stop a flush before it writes anything.
     #[cfg(test)]
     flush_gate: Arc<Mutex<()>>,
@@ -42,6 +47,18 @@ impl Default for Options {
     fn default() -> Options {
         Options { memtable_limit_bytes: 4 * 1024 * 1024, max_sstables: 4, sync_writes: true }
     }
+}
+
+/// The batch of synced writes waiting for the next WAL sync.
+#[derive(Default)]
+struct Commit {
+    records: Vec<Record>,
+    /// `records` as WAL bytes, in the same order.
+    encoded: Vec<u8>,
+    /// The batch's result once its sync ends; every writer whose record is in `records` holds a clone.
+    result: Arc<OnceLock<Result<(), (io::ErrorKind, String)>>>,
+    /// Whether a leader is writing and syncing a batch right now.
+    busy: bool,
 }
 
 /// A deleted key stays in the memtable as a Tombstone so older SSTables can't show through it.
@@ -220,6 +237,8 @@ impl Engine {
             options,
             state: Arc::new(RwLock::new(state)),
             sealing: Mutex::new(()),
+            commit: Mutex::default(),
+            committed: Condvar::new(),
             #[cfg(test)]
             flush_gate: Arc::default(),
         })
@@ -236,17 +255,59 @@ impl Engine {
     }
 
     fn write(&self, record: Record) -> io::Result<()> {
-        let mut state = self.state.write().unwrap();
-        state.wal.append(&record)?;
-        state.memtable_bytes += apply(&mut state.memtable, record);
-        if state.memtable_bytes > self.options.memtable_limit_bytes {
-            drop(state);
+        let mut encoded = Vec::new();
+        wal::encode(&record, &mut encoded)?;
+        let full = if self.options.sync_writes { self.group_commit(record, &encoded)? } else { self.commit([record], &encoded)? };
+        if full {
             // The write is already durable in the WAL, so failing to seal must not fail it; the next write retries.
             if let Err(e) = self.seal(self.options.memtable_limit_bytes) {
                 eprintln!("patina: cannot start a new WAL, retrying on the next write: {e}");
             }
         }
         Ok(())
+    }
+
+    /// Writes `encoded`, the WAL bytes of `records`, with one sync if `sync_writes` is on, then applies `records` to
+    /// the memtable. Returns whether that took the memtable past its limit; on error the memtable is unchanged.
+    fn commit(&self, records: impl IntoIterator<Item = Record>, encoded: &[u8]) -> io::Result<bool> {
+        let mut state = self.state.write().unwrap();
+        state.wal.write(encoded)?;
+        for record in records {
+            state.memtable_bytes += apply(&mut state.memtable, record);
+        }
+        Ok(state.memtable_bytes > self.options.memtable_limit_bytes)
+    }
+
+    /// Group commit: a writer that arrives while another batch syncs queues its record, and the first of the queued
+    /// writers to wake commits them all with one sync. Returns that sync's result, so Ok only once a sync covering
+    /// `record` has ended. Only the leader reports a full memtable, so one writer per batch seals.
+    /// A lone writer leads a batch of one and pays one sync per write, as before.
+    fn group_commit(&self, record: Record, encoded: &[u8]) -> io::Result<bool> {
+        let mut commit = self.commit.lock().unwrap();
+        commit.records.push(record);
+        commit.encoded.extend_from_slice(encoded);
+        let result = Arc::clone(&commit.result);
+        while commit.busy && result.get().is_none() {
+            commit = self.committed.wait(commit).unwrap();
+        }
+        if let Some(done) = result.get() {
+            return done.clone().map(|()| false).map_err(|(kind, message)| io::Error::new(kind, message));
+        }
+        // Take the batch, so writers that arrive during this sync queue up for the next one.
+        commit.busy = true;
+        let (records, encoded) = (mem::take(&mut commit.records), mem::take(&mut commit.encoded));
+        commit.result = Arc::default();
+        drop(commit);
+        // Caught so a panic still wakes the followers, which would otherwise wait forever.
+        let committed = catch_unwind(AssertUnwindSafe(|| self.commit(records, &encoded)));
+        let _ = result.set(match &committed {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err((e.kind(), e.to_string())),
+            Err(_) => Err((io::ErrorKind::Other, "the write that synced this batch panicked".to_string())),
+        });
+        self.commit.lock().unwrap().busy = false;
+        self.committed.notify_all();
+        committed.unwrap_or_else(|panic| resume_unwind(panic))
     }
 
     /// If the memtable holds more than `limit` bytes, seals it behind a fresh memtable and WAL and starts flushing it
@@ -705,6 +766,58 @@ mod tests {
         e.put(b"k", b"old").unwrap();
         assert!(e.put(b"k", &vec![0; MAX_RECORD]).is_err());
         assert_eq!(e.get(b"k").unwrap(), Some(b"old".to_vec()));
+    }
+
+    /// Puts keys [0] to [7] from 8 threads, holding the lock so the first writer stalls before its sync until the other
+    /// 7 have queued behind it and must share the next batch. `before` runs under that lock. Returns each put's result.
+    fn eight_puts_with_seven_queued(e: &Engine, before: impl FnOnce(&mut State)) -> Vec<io::Result<()>> {
+        thread::scope(|s| {
+            let mut state = e.state.write().unwrap();
+            before(&mut state);
+            let writers: Vec<_> = (0..8u8).map(|t| s.spawn(move || e.put(&[t], b"v"))).collect();
+            // Gives up after 10 s, so a broken queue fails the assert below instead of hanging.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while e.commit.lock().unwrap().records.len() < 7 && std::time::Instant::now() < deadline {
+                thread::yield_now();
+            }
+            let queued = e.commit.lock().unwrap().records.len();
+            drop(state);
+            assert_eq!(queued, 7, "the other 7 writers never queued behind the first");
+            writers.into_iter().map(|w| w.join().unwrap()).collect()
+        })
+    }
+
+    #[test]
+    fn concurrent_synced_writes_share_syncs_and_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        assert!(eight_puts_with_seven_queued(&e, |_| {}).iter().all(Result::is_ok));
+        assert_eq!(e.state.read().unwrap().wal.syncs, 2, "8 writes, one leader alone, then 7 in one batch");
+
+        // Unstalled: however the batches fall, every acked write must survive.
+        thread::scope(|s| {
+            for t in 0..8u8 {
+                let e = &e;
+                s.spawn(move || (0..50u8).for_each(|i| e.put(&[t, i], &[i]).unwrap()));
+            }
+        });
+        drop(e);
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        for t in 0..8u8 {
+            assert_eq!(e.get(&[t]).unwrap(), Some(b"v".to_vec()));
+            for i in 0..50u8 {
+                assert_eq!(e.get(&[t, i]).unwrap(), Some(vec![i]));
+            }
+        }
+    }
+
+    #[test]
+    fn a_failed_batch_fails_every_write_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = Engine::open(dir.path(), Options::default()).unwrap();
+        let results = eight_puts_with_seven_queued(&e, |state| state.wal.failed = true);
+        assert!(results.iter().all(Result::is_err), "a write acked without reaching the WAL: {results:?}");
+        assert!(e.state.read().unwrap().memtable.is_empty());
     }
 
     #[test]

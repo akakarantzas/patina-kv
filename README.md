@@ -8,7 +8,7 @@ HTTP ──► service/ (Java, Spring Boot) ──FFM──► engine/ (Rust cdy
 
 Rust owns all storage logic; Java is a thin HTTP layer. It's the same embedding model Kafka Streams and Flink use with RocksDB.
 
-A test kills the writer process 120 times and no acknowledged write is lost. On one laptop it ties RocksDB on fsynced writes, stays within 10% on gets, and is 1.2–1.6× faster on unsynced 100-byte writes, but 2.6–4.1× slower on average on unsynced 4 KiB writes and 3.6× slower on 100-byte scans. [Results](#results) explains why.
+A test kills the writer process 120 times and no acknowledged write is lost. On one laptop it ties RocksDB on fsynced writes from one thread (1.2× slower from 8 threads), stays within 10% on gets, and is 1.2–1.6× faster on unsynced 100-byte writes, but 2.6–4.1× slower on average on unsynced 4 KiB writes and 3.6× slower on 100-byte scans. [Results](#results) explains why.
 
 ## Run
 
@@ -45,7 +45,7 @@ payload = [op u8 = 0][key_len u32][key][value_len u32][value]   put
         | [op u8 = 1][key_len u32][key]                         delete
 ```
 
-A record goes out in one write and is fsynced before the call returns (unless sync-writes is off). If the write or fsync fails, the call errors, the memtable is unchanged, and the WAL refuses further appends until reopened, because a partial record would hide everything written after it.
+A record goes out in one write and is fsynced before the call returns (unless sync-writes is off). Synced writes that arrive while an fsync is running queue up, and the first of them to wake writes them all at once and fsyncs once (group commit): a test has 8 threads write at once and counts 2 fsyncs. If the write or fsync fails, every call in that batch errors, the memtable is unchanged, and the WAL refuses further appends until reopened, because a partial record would hide everything written after it.
 
 On open, recovery replays every WAL file left, oldest first, each up to its first incomplete or corrupt record, and truncates and syncs a file cut short. Tested by cutting a log at every byte offset.
 
@@ -75,7 +75,7 @@ An SSTable is sorted entries plus a footer (entry count, `compacted_through`, cr
 
 ## Results
 
-AMD Ryzen 7 5700U, 15.3 GiB RAM, Samsung MZVLB512HBJQ NVMe SSD, Windows 11 Home (plugged in), Temurin 25.0.5, rustc 1.99.1, rocksdbjni 11.8.1, JMH 1.37. Every row comes from one run on commit `fce7797`. One thread, one fork per row: `±` is the 99.9% interval over that row's 5 iterations, and separate runs have differed by up to about 20%. Numbers are rounded to two significant digits of their `±`; the exact values, the full conditions and two before/after comparisons are in [docs/benchmarks.md](docs/benchmarks.md). To reproduce: `cd service && ./gradlew jmh` (about 27 minutes; output in `service/build/results/jmh/results.txt`).
+AMD Ryzen 7 5700U, 15.3 GiB RAM, Samsung MZVLB512HBJQ NVMe SSD, Windows 11 Home (plugged in), Temurin 25.0.5, rustc 1.99.1, rocksdbjni 11.8.1, JMH 1.37. Every row except the concurrent one comes from one run on commit `fce7797`; that one comes from a later run. One thread (8 in the concurrent row), one fork per row: `±` is the 99.9% interval over that row's 5 iterations, and separate runs have differed by up to about 20%. Numbers are rounded to two significant digits of their `±`; the exact values, the full conditions and two before/after comparisons are in [docs/benchmarks.md](docs/benchmarks.md). To reproduce: `cd service && ./gradlew jmh` (about 31 minutes; output in `service/build/results/jmh/results.txt`).
 
 ### Patina vs RocksDB
 
@@ -100,6 +100,16 @@ ops/s, higher is better:
 
 Moving compaction to a background thread made unsynced writes 3.1–6.4× faster; moving the flush made no measurable difference ([details](docs/benchmarks.md#moving-compaction-off-the-write-path)).
 
+### Concurrent synced writes
+
+8 threads put random keys with 100 B values into one store, sync on, with the same settings, warmup, measurement and 2-minute pause as above. This is a later run, on the group-commit change; its single-threaded rows landed within error of the table above ([details](docs/benchmarks.md#group-commit)).
+
+ops/s across all 8 threads, higher is better:
+
+| Benchmark | Value | Sync | Patina | RocksDB |
+|---|---|---|---:|---:|
+| syncedPut8Threads | 100 B | on | 3,360 ± 110 | 4,120 ± 310 |
+
 ### FFM cost per call
 
 One hot key in the memtable, read and written through `PatinaEngine` with sync off, against a `ConcurrentSkipListMap`. Warmup 10 × 2 s, measurement 5 × 2 s.
@@ -118,13 +128,14 @@ A get crosses the boundary twice (`patina_get`, `patina_free`) and copies the va
 ### Why Patina loses
 
 - **Unsynced 4 KiB writes, 2.6–4.1× slower.** Only one full memtable can wait for its flush, so writes go no faster than flushes, and a flush shares the disk with a full compaction that rewrites the whole store. Patina's iterations swing with it, from about 2,000 to 37,500 ops/s, so its error bars are wider than its scores. RocksDB fills a 64 MiB buffer before it flushes, 16× less often, and compacts level by level instead of rewriting everything. At 100 B Patina is 1.2× (sequential) to 1.6× (random) faster, outside error.
-- **Synced writes tie.** Both engines wait for one fsync per write, 1.1–1.2 ms here, which swamps everything else.
+- **Single-threaded synced writes tie.** Both engines wait for one fsync per write, 1.1–1.2 ms here, which swamps everything else.
+- **8-thread synced writes, 1.2× slower.** In the concurrent row's run, 8 threads gave Patina 3.9× its single-threaded randomPut rate and RocksDB 4.9×. This run doesn't show why.
 - **100 B scans, 3.6× slower.** Patina reads each value with its own seek and read behind a per-table mutex, about 2.2 µs per entry; RocksDB reads blocks of many entries. The boundary isn't the cost: a scan crosses it twice, like a get, well under 1 µs (FFM table) of the 220 µs the scan takes. At 4 KiB the two tie.
 - **Gets: tie at 100 B, 1.1× slower at 4 KiB.** Every key is in memory, so a get is one map lookup per memtable and one per table, then one read; the 48 MiB dataset most likely sat in the OS file cache. This run doesn't show why RocksDB pulls ahead at 4 KiB.
 
 ## Limitations
 
-- Single node, single writer: one lock, one fsync per synced write, no group commit (about 810–870 synced writes/s here).
+- Single node, one lock, held through each WAL fsync. Concurrent synced writers share an fsync, but a lone writer still pays one per write (about 800–880 synced writes/s here).
 - Every key is in memory (a full index per SSTable), and open reads every SSTable end to end.
 - Compaction always merges every table, so its cost grows with the store, and it needs disk space for a second copy of the data.
 - One memtable at a time waits for its flush, so once flushes fall behind, for example while a full compaction shares the disk, writes run at flush speed.

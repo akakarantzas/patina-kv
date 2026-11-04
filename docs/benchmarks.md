@@ -1,6 +1,6 @@
 # Benchmarks
 
-The raw numbers behind the README's [Results](../README.md#results), how they were measured, why synced-write trials pause, and two before/after comparisons from the engine's history.
+The raw numbers behind the README's [Results](../README.md#results), how they were measured, why synced-write trials pause, the group-commit run, and two before/after comparisons from the engine's history.
 
 ## Setup
 
@@ -14,7 +14,7 @@ Every engine setting is listed in the README and, one by one, in the header comm
 
 ## Exact results
 
-[results-fce7797.txt](results-fce7797.txt) is JMH's own output for the run, unrounded: every Patina vs RocksDB row and the FFM table.
+[results-fce7797.txt](results-fce7797.txt) is JMH's own output for the run, unrounded: every Patina vs RocksDB row except the concurrent one, and the FFM table.
 
 ## Why synced trials pause for 2 minutes
 
@@ -28,6 +28,17 @@ Running a synced trial right after that heavy trial shows it hits both engines:
 | RocksDB | 313.741, 94.409, 16.191 | 17.939, 363.383, 825.854, 814.646, 806.375 |
 
 With the pause, every synced iteration in the run, warmups included, landed between 777.210 and 893.933 ops/s.
+
+## Group commit
+
+Measured on the group-commit change (the commit after `d226628`) in one full `./gradlew jmh` run on 2026-11-04 from 02:14 to 02:45, on the same machine, plugged in, with the OneDrive client not running when the run started. Windows' power log has no sleep or standby events in that window. The run adds `syncedPut8Threads`, named so it sorts last and the other trials keep their order.
+
+| syncedPut8Threads, 100 B, ops/s | Score | Iterations, warmups included |
+|---|---:|---|
+| Patina | 3,360.400 ± 105.312 | 3,320.819–3,493.373 |
+| RocksDB | 4,119.725 ± 311.067 | 3,877.519–4,254.413 |
+
+Every single-threaded synced iteration in the run, warmups included, landed between 767.010 and 905.926 ops/s. Patina's single-threaded synced rows landed within error of the `fce7797` run: sequentialPut 878.758 ± 54.644 (100 B) and 804.667 ± 65.639 (4 KiB), randomPut 862.082 ± 59.114 (100 B) and 811.543 ± 52.142 (4 KiB). A lone writer still pays one fsync per write.
 
 ## Moving compaction off the write path
 

@@ -22,6 +22,7 @@ import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
+import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 import org.rocksdb.CompressionType;
@@ -32,7 +33,8 @@ import org.rocksdb.RocksIterator;
 import org.rocksdb.WriteOptions;
 
 /**
- * Patina vs RocksDB, each through its Java API: one thread, a fresh JVM (fork) and a fresh temp dir per trial.
+ * Patina vs RocksDB, each through its Java API: one thread (syncedPut8Threads: 8), a fresh JVM (fork) and a fresh
+ * temp dir per trial.
  * Keys are 8-byte big-endian longs, so byte order is numeric order; values are random bytes of valueSize.
  *
  * <p>Patina settings: Options::default() from engine/src/lib.rs, that is a 4 MiB memtable limit and a full
@@ -49,7 +51,8 @@ import org.rocksdb.WriteOptions;
  * Everything else is the RocksDB default, including the 64 MiB write buffer, leveled compaction on background
  * threads, no bloom filter, the default block cache, and default ReadOptions.
  *
- * <p>Writes run with sync on and off. Reads have no sync param: sync only affects writes.
+ * <p>Writes run with sync on and off. Reads have no sync param: sync only affects writes. syncedPut8Threads puts
+ * from 8 threads at once with sync on, so writers that wait for a sync at the same time can share it (group commit).
  */
 @BenchmarkMode(Mode.Throughput)
 @OutputTimeUnit(TimeUnit.SECONDS)
@@ -78,6 +81,30 @@ public class PatinaVsRocksDb {
             if (sync) Thread.sleep(120_000);
             dir = Files.createTempDirectory("patina-bench");
             store = Store.open(engine, dir, sync);
+            value = randomBytes(valueSize);
+        }
+
+        @TearDown(Level.Trial)
+        public void close() throws Exception {
+            store.close();
+            deleteRecursively(dir);
+        }
+    }
+
+    /** Synced writes from 8 threads into one store; the score is all threads' puts per second together. */
+    @State(Scope.Benchmark)
+    public static class ConcurrentWrites {
+        @Param({"patina", "rocksdb"}) public String engine;
+        @Param("100") public int valueSize;
+        Path dir;
+        Store store;
+        byte[] value;
+
+        @Setup(Level.Trial)
+        public void open() throws Exception {
+            Thread.sleep(120_000); // synced, so the same pause as Writes
+            dir = Files.createTempDirectory("patina-bench");
+            store = Store.open(engine, dir, true);
             value = randomBytes(valueSize);
         }
 
@@ -131,6 +158,13 @@ public class PatinaVsRocksDb {
 
     @Benchmark
     public void randomPut(Writes w) throws Exception {
+        w.store.put(key(ThreadLocalRandom.current().nextLong()), w.value);
+    }
+
+    /** Named to sort last, so JMH still runs the other trials in the order the README's results came from. */
+    @Benchmark
+    @Threads(8)
+    public void syncedPut8Threads(ConcurrentWrites w) throws Exception {
         w.store.put(key(ThreadLocalRandom.current().nextLong()), w.value);
     }
 

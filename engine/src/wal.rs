@@ -20,10 +20,13 @@ pub enum Record {
 
 pub struct Wal {
     file: File,
-    failed: bool,
-    /// Whether `append` syncs before returning (the default). Off, an acked record has only reached the OS:
+    pub(crate) failed: bool,
+    /// Whether `write` syncs before returning (the default). Off, an acked record has only reached the OS:
     /// it survives a process crash but not power loss or an OS crash.
     pub sync: bool,
+    /// How many times this log has synced, for tests that check group commit shares one sync.
+    #[cfg(test)]
+    pub syncs: usize,
 }
 
 impl Wal {
@@ -53,41 +56,62 @@ impl Wal {
             file.sync_all()?;
         }
         file.seek(SeekFrom::Start(end as u64))?;
-        Ok((Wal { file, failed: false, sync: true }, records))
+        Ok((Wal { file, failed: false, sync: true, #[cfg(test)] syncs: 0 }, records))
     }
 
     /// Returns Ok only once the record is on disk, or with `sync` off, once the OS has it.
+    #[cfg(test)]
     pub fn append(&mut self, record: &Record) -> io::Result<()> {
+        let mut buf = Vec::new();
+        encode(record, &mut buf)?;
+        self.write(&buf)
+    }
+
+    /// Writes records `encode` built, then syncs once if `sync` is on: one fsync covers all of them.
+    pub fn write(&mut self, records: &[u8]) -> io::Result<()> {
         // A failed write can leave a partial record, and recovery stops there: anything appended after it would be lost.
         if self.failed {
             return Err(io::Error::other("an earlier WAL append failed; reopen the log to recover"));
         }
-        let (op, key, value) = match record {
-            Record::Put { key, value } => (OP_PUT, key, Some(value)),
-            Record::Delete { key } => (OP_DELETE, key, None),
-        };
-        let len = 1 + 4 + key.len() + value.map_or(0, |v| 4 + v.len());
-        if len > MAX_RECORD {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("WAL record of {len} bytes exceeds the {MAX_RECORD} byte limit"),
-            ));
-        }
-        let mut buf = Vec::with_capacity(HEADER + len);
-        buf.extend_from_slice(&[0; HEADER]); // filled in once the payload's crc is known
-        buf.push(op);
-        for field in std::iter::once(key).chain(value) {
-            buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
-            buf.extend_from_slice(field);
-        }
-        let crc = crc32fast::hash(&buf[HEADER..]);
-        buf[..4].copy_from_slice(&(len as u32).to_le_bytes());
-        buf[4..HEADER].copy_from_slice(&crc.to_le_bytes());
-
-        let result = self.file.write_all(&buf).and_then(|()| if self.sync { self.file.sync_data() } else { Ok(()) });
+        let result = self.file.write_all(records).and_then(|()| if self.sync { self.sync_data() } else { Ok(()) });
         self.failed = result.is_err();
         result
     }
+
+    fn sync_data(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.syncs += 1;
+        }
+        self.file.sync_data()
+    }
+}
+
+/// Appends `record`'s encoding to `buf`; fails without touching `buf` if it is over MAX_RECORD.
+pub fn encode(record: &Record, buf: &mut Vec<u8>) -> io::Result<()> {
+    let (op, key, value) = match record {
+        Record::Put { key, value } => (OP_PUT, key, Some(value)),
+        Record::Delete { key } => (OP_DELETE, key, None),
+    };
+    let len = 1 + 4 + key.len() + value.map_or(0, |v| 4 + v.len());
+    if len > MAX_RECORD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("WAL record of {len} bytes exceeds the {MAX_RECORD} byte limit"),
+        ));
+    }
+    let start = buf.len();
+    buf.reserve(HEADER + len);
+    buf.extend_from_slice(&[0; HEADER]); // filled in once the payload's crc is known
+    buf.push(op);
+    for field in std::iter::once(key).chain(value) {
+        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+        buf.extend_from_slice(field);
+    }
+    let crc = crc32fast::hash(&buf[start + HEADER..]);
+    buf[start..start + 4].copy_from_slice(&(len as u32).to_le_bytes());
+    buf[start + 4..start + HEADER].copy_from_slice(&crc.to_le_bytes());
+    Ok(())
 }
 
 /// The record at the start of `buf` and its encoded length; None if it is incomplete or corrupt.
